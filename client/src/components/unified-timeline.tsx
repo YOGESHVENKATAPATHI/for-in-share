@@ -343,7 +343,8 @@ import type { Tag } from "@shared/schema";
 
 function TagList({ tags }: { tags: Tag[] }) {
   const isMobile = useIsMobile();
-  const limit = isMobile ? 1 : 3;
+  // Show 1 tag in mobile, 2 tags in laptop/desktop
+  const limit = isMobile ? 1 : 2;
   const displayTags = tags.slice(0, limit);
   const remaining = tags.length - limit;
 
@@ -453,6 +454,7 @@ function FileTagsSection({
 
   const isExtractedFile = fileId.startsWith('extracted_');
   const [tagInput, setTagInput] = useState<string>("");
+  const isMobile = useIsMobile();
 
   const updateExtractedTagsMutation = useMutation({
     mutationFn: async ({ fileId, tags }: { fileId: string; tags: string[] }) => {
@@ -536,20 +538,33 @@ function FileTagsSection({
           </div>
         ) : (
           <>
-            {(file as any).tags && (file as any).tags.length > 0 && (
-              <div className="flex flex-wrap gap-1">
-                {(file as any).tags.map((tag: string, index: number) => (
-                  <Badge
-                    key={index}
-                    variant="secondary"
-                    className="text-xs"
-                    style={{ backgroundColor: "#6b7280", color: "white" }}
-                  >
-                    {tag.trim()}
-                  </Badge>
-                ))}
-              </div>
-            )}
+              {(file as any).tags && (file as any).tags.length > 0 && (
+                (() => {
+                  const tags = (file as any).tags || [];
+                  const limit = isMobile ? 1 : 2;
+                  const displayTags = tags.slice(0, limit);
+                  const remaining = tags.length - limit;
+                  return (
+                    <div className="flex flex-wrap gap-1">
+                      {displayTags.map((tag: string, index: number) => (
+                        <Badge
+                          key={index}
+                          variant="secondary"
+                          className="text-xs"
+                          style={{ backgroundColor: "#6b7280", color: "white" }}
+                        >
+                          {tag.trim()}
+                        </Badge>
+                      ))}
+                      {remaining > 0 && (
+                        <Badge variant="outline" className="text-xs text-muted-foreground">
+                          +{remaining}...
+                        </Badge>
+                      )}
+                    </div>
+                  );
+                })()
+              )}
             <Button
               variant="ghost"
               size="sm"

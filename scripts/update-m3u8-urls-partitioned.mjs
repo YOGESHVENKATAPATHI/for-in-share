@@ -4,6 +4,7 @@ import { Client } from 'pg';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
 import http from 'http';
+import KeepAliveService from './keep-alive.mjs';
 
 
 const connectionString = 'postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
@@ -11,7 +12,7 @@ const PART = parseInt(process.env.PART || '1', 10); // 1, 2, or 3
 const TOTAL_PARTS = parseInt(process.env.TOTAL_PARTS || '3', 10); // e.g., 3
 const UPDATE_INTERVAL_MS = 60000;
 const PORT = process.env.PORT || 3000;
-const KEEP_ALIVE_INTERVAL_MS = 30000; // Ping every 30 seconds to prevent shutdown
+const KEEP_ALIVE_INTERVAL_MS = parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || '30000', 10);
 const MAIN_SERVER_URLS = (process.env.MAIN_SERVER_URLS || 'http://localhost:3000').split(',').map(url => url.trim()); // Main server URLs for keep-alive pings, comma-separated
 let updaterStarted = false;
 let updaterError = null;
@@ -26,25 +27,10 @@ function logStatus(msg) {
   process.stdout.write(line + '\n');
 }
 
-async function keepAlivePing() {
-  for (const serverUrl of MAIN_SERVER_URLS) {
-    try {
-      const response = await fetch(`${serverUrl}/api/ping`, {
-        headers: {
-          'User-Agent': 'M3U8-Updater-KeepAlive',
-          'X-Keep-Alive': 'true'
-        },
-        timeout: 5000
-      });
-      if (response.ok) {
-        logStatus(`🔄 Keep-alive ping sent successfully to ${serverUrl}`);
-      } else {
-        logStatus(`⚠️ Keep-alive ping failed to ${serverUrl}: ${response.status}`);
-      }
-    } catch (error) {
-      logStatus(`⚠️ Keep-alive ping error to ${serverUrl}: ${error.message}`);
-    }
-  }
+// Use KeepAliveService helper for multi-server keep-alive
+const keepAlive = new KeepAliveService({ intervalMs: KEEP_ALIVE_INTERVAL_MS, timeoutMs: parseInt(process.env.KEEP_ALIVE_TIMEOUT || '5000', 10) });
+for (const s of MAIN_SERVER_URLS) {
+  if (s) keepAlive.addServer(s);
 }
 
 
@@ -199,13 +185,23 @@ const server = http.createServer((req, res) => {
     res.end('Updater not started.');
     return;
   }
-  res.end('Updater running. Last update cycle: ' + (lastUpdateCycle ? lastUpdateCycle.toISOString() : 'never') + '\n' + logBuffer.join('\n'));
+  const kaStatus = keepAlive.getStatus();
+  res.end('Updater running. Last update cycle: ' + (lastUpdateCycle ? lastUpdateCycle.toISOString() : 'never') + '\n' + JSON.stringify(kaStatus, null, 2) + '\n' + logBuffer.join('\n'));
 });
 
 server.listen(PORT, () => {
   logStatus(`Status server listening on port ${PORT}`);
-  
-  // Start keep-alive pings to prevent shutdown
-  setInterval(keepAlivePing, KEEP_ALIVE_INTERVAL_MS);
+  keepAlive.start();
   logStatus(`🔄 Keep-alive pings started (every ${KEEP_ALIVE_INTERVAL_MS/1000}s to ${MAIN_SERVER_URLS.length} servers)`);
+});
+
+process.on('SIGINT', () => {
+  logStatus('Process SIGINT received, stopping keep-alive');
+  keepAlive.stop();
+  process.exit();
+});
+process.on('SIGTERM', () => {
+  logStatus('Process SIGTERM received, stopping keep-alive');
+  keepAlive.stop();
+  process.exit();
 });

@@ -5,10 +5,10 @@ import * as cheerio from 'cheerio';
 import { spawnSync } from 'child_process';
 import { Client } from 'pg';
 import http from 'http';
+import KeepAliveService from './keep-alive.mjs';
 
 const proxyUrl = 'https://webproxier-ov6et6gpw-ogeshs-projects.vercel.app/api/proxy?url=';
-const PORT = process.env.PORT || 3002; // Different port from updater
-const KEEP_ALIVE_INTERVAL_MS = 30000; // Ping every 30 seconds to prevent shutdown
+const KEEP_ALIVE_INTERVAL_MS = parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || '30000', 10); // Ping every 30 seconds to prevent shutdown
 const MAIN_SERVER_URLS = (process.env.MAIN_SERVER_URLS || 'http://localhost:3000').split(',').map(url => url.trim()); // Main server URLs for keep-alive pings, comma-separated
 
 async function extractUrls(mainUrl) {
@@ -270,25 +270,10 @@ function logStatus(msg) {
   console.log(line);
 }
 
-async function keepAlivePing() {
-  for (const serverUrl of MAIN_SERVER_URLS) {
-    try {
-      const response = await fetch(`${serverUrl}/api/ping`, {
-        headers: {
-          'User-Agent': 'URL-Extractor-KeepAlive',
-          'X-Keep-Alive': 'true'
-        },
-        timeout: 5000
-      });
-      if (response.ok) {
-        logStatus(`🔄 Keep-alive ping sent successfully to ${serverUrl}`);
-      } else {
-        logStatus(`⚠️ Keep-alive ping failed to ${serverUrl}: ${response.status}`);
-      }
-    } catch (error) {
-      logStatus(`⚠️ Keep-alive ping error to ${serverUrl}: ${error.message}`);
-    }
-  }
+// KeepAliveService handles pinging multiple servers
+const keepAlive = new KeepAliveService({ intervalMs: KEEP_ALIVE_INTERVAL_MS, timeoutMs: parseInt(process.env.KEEP_ALIVE_TIMEOUT || '5000', 10) });
+for (const s of MAIN_SERVER_URLS) {
+  if (s) keepAlive.addServer(s);
 }
 
 // Periodically print extraction status
@@ -340,13 +325,25 @@ const server = http.createServer((req, res) => {
     res.end('Extraction complete. All mappings saved to NeonDB.\n' + logBuffer.join('\n'));
     return;
   }
-  res.end('Extraction in progress...\n' + logBuffer.join('\n'));
+  const kaStatus = keepAlive.getStatus();
+  res.end('Extraction in progress...\n' + JSON.stringify(kaStatus, null, 2) + '\n' + logBuffer.join('\n'));
 });
 
 server.listen(PORT, () => {
   origConsoleLog(`Status server listening on port ${PORT}`);
-  
   // Start keep-alive pings to prevent shutdown
-  setInterval(keepAlivePing, KEEP_ALIVE_INTERVAL_MS);
+  keepAlive.start();
   logStatus(`🔄 Keep-alive pings started (every ${KEEP_ALIVE_INTERVAL_MS/1000}s to ${MAIN_SERVER_URLS.length} servers)`);
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  logStatus('Process SIGINT received, stopping keep-alive');
+  keepAlive.stop();
+  process.exit();
+});
+process.on('SIGTERM', () => {
+  logStatus('Process SIGTERM received, stopping keep-alive');
+  keepAlive.stop();
+  process.exit();
 });

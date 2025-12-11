@@ -1,0 +1,59 @@
+# Render configuration for upload server (production)
+
+  services: 
+    
+      type: web
+      name: forum-upload-production
+      env: node
+      plan: free
+      buildCommand: npm install && npx puppeteer browsers install chrome --path ./chrome
+      startCommand: npm run start:worker upload
+      envVars: 
+        
+          key: NODE_ENV
+          value: production
+        
+        
+          key: PUPPETEER_EXECUTABLE_PATH
+          value: ./chrome/chrome-linux64/chrome
+        
+        
+          key: WORKER_TYPE
+          value: upload
+        
+        
+          key: MAX_MEMORY_MB
+          value: 400
+        
+        
+          key: MAX_CONNECTIONS
+          value: 100
+        
+        
+          key: HEALTH_CHECK_INTERVAL
+          value: 30000
+        
+        
+          key: FORCE_GC_INTERVAL
+          value: 30000
+        
+        
+          key: DATABASE_URL
+          sync: false
+        
+        
+          key: DROPBOX_APP_KEY
+          sync: false
+        
+        
+          key: DROPBOX_APP_SECRET
+          sync: false
+        
+        
+          key: DROPBOX_REFRESH_TOKEN
+          sync: false
+        
+      
+    
+  
+}

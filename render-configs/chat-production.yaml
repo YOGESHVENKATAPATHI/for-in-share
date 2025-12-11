@@ -1,0 +1,47 @@
+# Render configuration for chat server (production)
+
+  services: 
+    
+      type: web
+      name: forum-chat-production
+      env: node
+      plan: free
+      buildCommand: npm install && npx puppeteer browsers install chrome --path ./chrome
+      startCommand: npm run start:worker chat
+      envVars: 
+        
+          key: NODE_ENV
+          value: production
+        
+        
+          key: PUPPETEER_EXECUTABLE_PATH
+          value: ./chrome/chrome-linux64/chrome
+        
+        
+          key: WORKER_TYPE
+          value: chat
+        
+        
+          key: MAX_MEMORY_MB
+          value: 300
+        
+        
+          key: MAX_CONNECTIONS
+          value: 2000
+        
+        
+          key: HEALTH_CHECK_INTERVAL
+          value: 30000
+        
+        
+          key: FORCE_GC_INTERVAL
+          value: 30000
+        
+        
+          key: DATABASE_URL
+          sync: false
+        
+      
+    
+  
+}

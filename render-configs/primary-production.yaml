@@ -1,0 +1,71 @@
+# Render configuration for primary server (production)
+
+  services: 
+    
+      type: web
+      name: forum-primary-production
+      env: node
+      plan: free
+      buildCommand: npm install && npx puppeteer browsers install chrome --path ./chrome
+      startCommand: npm start
+      envVars: 
+        
+          key: NODE_ENV
+          value: production
+        
+        
+          key: PUPPETEER_EXECUTABLE_PATH
+          value: ./chrome/chrome-linux64/chrome
+        
+        
+          key: MAX_MEMORY_MB
+          value: 450
+        
+        
+          key: MAX_CONNECTIONS
+          value: 1000
+        
+        
+          key: LOAD_BALANCE_STRATEGY
+          value: least-load
+        
+        
+          key: HEALTH_CHECK_INTERVAL
+          value: 30000
+        
+        
+          key: FORCE_GC_INTERVAL
+          value: 30000
+        
+        
+          key: DATABASE_URL
+          sync: false
+        
+        
+          key: DROPBOX_APP_KEY
+          sync: false
+        
+        
+          key: DROPBOX_APP_SECRET
+          sync: false
+        
+        
+          key: DROPBOX_REFRESH_TOKEN
+          sync: false
+        
+        
+          key: WORKER_SERVERS
+          value: UPDATE_AFTER_WORKER_DEPLOYMENT
+        
+        
+          key: UPLOAD_WORKERS
+          value: UPDATE_AFTER_WORKER_DEPLOYMENT
+        
+        
+          key: CHAT_WORKERS
+          value: UPDATE_AFTER_WORKER_DEPLOYMENT
+        
+      
+    
+  
+}

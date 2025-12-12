@@ -550,6 +550,29 @@ export default function ForumPage() {
     }
   }, [scrollToFile, specificFile, relatedFiles, allFiles]);
 
+  // If a specific file was requested via URL (scrollToFile), ensure it's present
+  // in the search results and allFiles so UnifiedTimeline / FileList can render it.
+  // Also open the preview automatically so shareable links load the target file.
+  useEffect(() => {
+    if (!scrollToFile || !specificFile) return;
+
+    // Add to searchFiles if not already present (so search view will include it)
+    setSearchFiles(prev => {
+      if (prev.find(f => f.id === specificFile.id)) return prev;
+      return [specificFile, ...prev];
+    });
+
+    // Also add to allFiles (files list, timeline view fallback)
+    setAllFiles(prev => {
+      if (prev.find(f => f.id === specificFile.id)) return prev;
+      return [specificFile, ...prev];
+    });
+
+    // Open preview to ensure the user sees the requested file immediately
+    setPreviewFile(specificFile);
+    setPreviewOpen(true);
+  }, [scrollToFile, specificFile]);
+
   const loadMoreFiles = async () => {
     setFilesOffset(prev => prev + filesLimit);
   };

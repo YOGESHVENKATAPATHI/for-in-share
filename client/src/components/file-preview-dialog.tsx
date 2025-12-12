@@ -160,7 +160,7 @@ export function FilePreviewDialog({ file, open, onClose, onDownload }: FilePrevi
                   <span>•</span>
                 </>
               )}
-              <span>Uploaded by {file.user.username}</span>
+              <span>Uploaded by {file.user?.username || file.adminCreatedBy || 'Unknown'}</span>
             </div>
             <div className="flex items-center gap-2">
               {!(file.mimeType?.startsWith("application/x-mpegurl") || file.fileName.toLowerCase().endsWith('.m3u8')) && (

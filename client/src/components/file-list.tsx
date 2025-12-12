@@ -132,6 +132,27 @@ export function FileList({ files, isLoading, forumId, onPreview, ws, isLoadingMo
           description: data.error || "An error occurred during download",
           variant: "destructive",
         });
+      } else if (data.type === 'file_deleted') {
+        // Clean up any transient UI state related to the deleted file
+        const fileId = data.fileId;
+        setDownloadingFiles((prev) => {
+          const { [fileId]: _, ...rest } = prev;
+          return rest;
+        });
+        setProcessingFiles((prev) => {
+          const { [fileId]: _, ...rest } = prev;
+          return rest;
+        });
+        setUploadingFiles((prev) => {
+          const newUploading = { ...prev };
+          Object.keys(newUploading).forEach(k => {
+            if (newUploading[k].fileName === data.fileName || k === data.uploadId) {
+              delete newUploading[k];
+            }
+          });
+          return newUploading;
+        });
+        toast({ title: 'File deleted', description: 'A file was removed', variant: 'default' });
       }
     };
 
@@ -386,7 +407,7 @@ export function FileList({ files, isLoading, forumId, onPreview, ws, isLoadingMo
                   <ImageWithProxy
                     src={file.adminThumbnailUrl}
                     alt={file.fileName}
-                    className="w-20 h-22 object-cover rounded-md shrink-0 cursor-pointer sm:hidden border border-zinc-700"
+                    className="w-28 h-28 object-cover rounded-md shrink-0 cursor-pointer sm:hidden border border-zinc-700"
                     onClick={() => onPreview?.(file)}
                   />
                 ) : file.mimeType?.startsWith("video/") ? (
@@ -394,7 +415,7 @@ export function FileList({ files, isLoading, forumId, onPreview, ws, isLoadingMo
                     <ImageWithProxy
                       src={file.thumbnail}
                       alt={file.fileName}
-                      className="w-20 h-22 object-cover rounded-md shrink-0 cursor-pointer sm:hidden border border-zinc-700"
+                      className="w-28 h-28 object-cover rounded-md shrink-0 cursor-pointer sm:hidden border border-zinc-700"
                       onClick={() => onPreview?.(file)}
                     />
                   ) : (
@@ -410,24 +431,24 @@ export function FileList({ files, isLoading, forumId, onPreview, ws, isLoadingMo
                     <ImageWithProxy
                       src={file.thumbnail}
                       alt={file.fileName}
-                      className="w-20 h-22 object-cover rounded-md shrink-0 cursor-pointer sm:hidden border border-zinc-700"
+                      className="w-28 h-28 object-cover rounded-md shrink-0 cursor-pointer sm:hidden border border-zinc-700"
                       onClick={() => onPreview?.(file)}
                     />
                   ) : (
-                    <div className="w-20 h-22 rounded-md bg-zinc-800 shrink-0 sm:hidden flex items-center justify-center cursor-pointer" onClick={() => onPreview?.(file)}>
-                      <File className="h-20 w-20 text-zinc-400" />
+                      <div className="w-28 h-28 rounded-md bg-zinc-800 shrink-0 sm:hidden flex items-center justify-center cursor-pointer" onClick={() => onPreview?.(file)}>
+                        <File className="h-8 w-8 text-zinc-400" />
                     </div>
                   )
                 ) : (
                   <div className="p-1.5 sm:p-2 rounded-none bg-zinc-800 shrink-0 sm:hidden">
-                    <File className="h-20 w-20 sm:h-6 sm:w-6 text-zinc-400" />
+                    <File className="h-8 w-8 sm:h-6 sm:w-6 text-zinc-400" />
                   </div>
                 )}
                 {file.adminThumbnailUrl ? (
                   <ImageWithProxy
                     src={file.adminThumbnailUrl}
                     alt={file.fileName}
-                    className="w-20 h-22 object-cover rounded-md shrink-0 cursor-pointer hidden sm:block border border-zinc-700"
+                    className="w-32 h-32 object-cover rounded-md shrink-0 cursor-pointer hidden sm:block border border-zinc-700"
                     onClick={() => onPreview?.(file)}
                   />
                 ) : file.mimeType?.startsWith("video/") ? (
@@ -435,7 +456,7 @@ export function FileList({ files, isLoading, forumId, onPreview, ws, isLoadingMo
                     <ImageWithProxy
                       src={file.thumbnail}
                       alt={file.fileName}
-                      className="w-20 h-22 object-cover rounded-md shrink-0 cursor-pointer hidden sm:block border border-zinc-700"
+                      className="w-32 h-32 object-cover rounded-md shrink-0 cursor-pointer hidden sm:block border border-zinc-700"
                       onClick={() => onPreview?.(file)}
                     />
                   ) : (
@@ -451,12 +472,12 @@ export function FileList({ files, isLoading, forumId, onPreview, ws, isLoadingMo
                     <ImageWithProxy
                       src={file.thumbnail}
                       alt={file.fileName}
-                      className="w-20 h-22 object-cover rounded-md shrink-0 cursor-pointer hidden sm:block border border-zinc-700"
+                      className="w-32 h-32 object-cover rounded-md shrink-0 cursor-pointer hidden sm:block border border-zinc-700"
                       onClick={() => onPreview?.(file)}
                     />
                   ) : (
-                    <div className="w-20 h-22 rounded-md bg-zinc-800 shrink-0 flex items-center justify-center cursor-pointer" onClick={() => onPreview?.(file)}>
-                      <File className="h-8 w-8 text-zinc-400" />
+                    <div className="w-32 h-32 rounded-md bg-zinc-800 shrink-0 flex items-center justify-center cursor-pointer" onClick={() => onPreview?.(file)}>
+                      <File className="h-10 w-10 text-zinc-400" />
                     </div>
                   )
                 ) : (
@@ -476,8 +497,8 @@ export function FileList({ files, isLoading, forumId, onPreview, ws, isLoadingMo
                     <span className="flex items-center gap-1">
                       <User className="h-3 w-3" />
                       <span className="truncate max-w-20 sm:max-w-none">
-                        {file.adminCreatedBy || file.user.username}
-                      </span>
+                          {file.adminCreatedBy || file.user?.username || 'Unknown'}
+                        </span>
                     </span>
                     <span className="text-xs">{formatDistanceToNow(new Date(file.uploadedAt), { addSuffix: true })}</span>
                   </div>

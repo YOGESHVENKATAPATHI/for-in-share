@@ -11,11 +11,13 @@ export interface Tag {
 }
 
 // Fetch all available tags
-export function useTags() {
+export function useTags(options?: { includeExtracted?: boolean }) {
+  const includeExtracted = options?.includeExtracted === true;
   return useQuery({
-    queryKey: ['tags'],
+    queryKey: ['tags', { includeExtracted }],
     queryFn: async (): Promise<Tag[]> => {
-      const response = await fetch('/api/tags');
+      const url = `/api/tags${includeExtracted ? '?includeExtracted=true' : ''}`;
+      const response = await fetch(url);
       if (!response.ok) {
         throw new Error('Failed to fetch tags');
       }
@@ -205,9 +207,9 @@ export function useRemoveTag() {
 }
 
 // Hook for managing tags on an entity (combines fetching and mutations)
-export function useEntityTagManager(entityType: string, entityId: string) {
+export function useEntityTagManager(entityType: string, entityId: string, options?: { includeExtracted?: boolean }) {
   const { data: entityTags = [], isLoading } = useEntityTags(entityType, entityId);
-  const { data: allTags = [] } = useTags();
+  const { data: allTags = [] } = useTags({ includeExtracted: options?.includeExtracted });
 
   const [selectedTags, setSelectedTags] = useState<Tag[]>(entityTags);
 

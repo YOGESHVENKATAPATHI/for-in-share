@@ -210,7 +210,7 @@ function FileCard({ file }: { file: FileWithChunks & { user: User; forum: Forum 
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
               <span>in {file.forum.name}</span>
               <span>•</span>
-              <span>by {file.user.username}</span>
+              <span>by {file.user?.username || file.adminCreatedBy || 'Unknown'}</span>
               <span>•</span>
               <span>{formatDistanceToNow(new Date(file.uploadedAt), { addSuffix: true })}</span>
             </div>
@@ -232,7 +232,7 @@ function MessageCard({ message }: { message: MessageWithUser & { forum: Forum } 
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
                 <span>in {message.forum.name}</span>
                 <span>•</span>
-                <span>by {message.user.username}</span>
+                <span>by {message.user?.username || 'Unknown'}</span>
                 <span>•</span>
                 <span>{formatDistanceToNow(new Date(message.createdAt), { addSuffix: true })}</span>
               </div>

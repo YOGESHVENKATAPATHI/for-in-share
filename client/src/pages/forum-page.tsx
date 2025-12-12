@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { useRoute, useSearch, Link } from "wouter";
+import { useRoute, useSearch, useLocation, Link } from "wouter";
 import { useAuth } from "@/hooks/use-auth";
 import { useToast } from "@/hooks/use-toast";
-import { useEntityTagManager, useTags, useMultipleEntityTags } from "@/hooks/use-tags";
+import { useEntityTagManager } from "@/hooks/use-tags";
 import { queryClient } from "@/lib/queryClient";
 import type { Forum, MessageWithUser, FileWithChunks } from "@shared/schema";
 import { Button } from "@/components/ui/button";
@@ -24,7 +24,6 @@ import { UnifiedTimeline } from "@/components/unified-timeline";
 import { PartialUploadsManager } from "@/components/partial-uploads-manager";
 import { PeoplePanel } from "@/components/people-panel";
 import { AccessRequestsManager } from "@/components/access-requests-manager";
-import { TagFilter } from "@/components/tag-filter";
 import { TagInput } from "@/components/tag-input";
 import { StructuredData } from "@/components/structured-data";
 import { MetaTags } from "@/components/meta-tags";
@@ -37,11 +36,12 @@ interface TagItem {
   color?: string | null;
 }
 
-function TagList({ tags }: { tags: TagItem[] }) {
+function TagList({ tags }: { tags?: TagItem[] }) {
   const isMobile = useIsMobile();
   const limit = isMobile ? 1 : 3;
-  const displayTags = tags.slice(0, limit);
-  const remaining = tags.length - limit;
+  const safeTags = tags || [];
+  const displayTags = safeTags.slice(0, limit);
+  const remaining = Math.max(0, safeTags.length - limit);
 
   return (
     <div className="flex flex-wrap gap-1">
@@ -72,6 +72,7 @@ export default function ForumPage() {
   const [, params] = useRoute("/forum/:id");
   const search = useSearch();
   const forumId = params?.id;
+  const [, setLocation] = useLocation();
   const { user } = useAuth();
     const { data: forum, isLoading: forumLoading } = useQuery<Forum>({
       queryKey: ["/api/forums", forumId],
@@ -102,13 +103,14 @@ export default function ForumPage() {
   const [previewFile, setPreviewFile] = useState<FileWithChunks | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [editingForumTags, setEditingForumTags] = useState(false);
-  const [selectedFilterTagIds, setSelectedFilterTagIds] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
   const [filesLimit, setFilesLimit] = useState(10);
   const [filesOffset, setFilesOffset] = useState(0);
   const [allFiles, setAllFiles] = useState<FileWithChunks[]>([]);
   const [hasMoreFiles, setHasMoreFiles] = useState(true);
+  const [totalFilesCount, setTotalFilesCount] = useState<number | null>(null);
+  const [extractedFilesCount, setExtractedFilesCount] = useState<number | null>(null);
 
   // Debounce search query for performance
   useEffect(() => {
@@ -140,12 +142,320 @@ export default function ForumPage() {
   });
 
   // Global search query for when user searches
+  const includeExtracted = forum?.name === 'Xmaster';
+
   const { data: searchResults, isLoading: isSearching } = useQuery({
-    queryKey: ["/api/search", debouncedSearchQuery],
+    queryKey: ["/api/search", debouncedSearchQuery, forumId],
+    queryFn: async () => {
+      const q = encodeURIComponent(debouncedSearchQuery);
+      const res = await fetch(`/api/search?q=${q}${forumId ? `&forumId=${forumId}` : ''}`);
+      if (!res.ok) throw new Error('Failed to fetch search results');
+      return res.json();
+    },
     enabled: !!debouncedSearchQuery.trim(),
-    onSuccess: (data) => console.log('[ForumPage] Search results loaded:', data),
+    onSuccess: (data) => {
+      console.log('[ForumPage] Search results loaded:', data);
+      (data.files || []).forEach((f: any) => fetchAndMergeFile(f));
+    },
     onError: (error) => console.log('[ForumPage] Search error:', error),
   });
+
+  // Paginated aggregated search state (merged local + extracted)
+  const [searchFiles, setSearchFiles] = useState<any[]>([]);
+  // Track totals separately to avoid "Showing 9 of 0" when extracted files exist
+  const [searchLocalTotalFiles, setSearchLocalTotalFiles] = useState<number>(0);
+  const [searchExtractedTotalFiles, setSearchExtractedTotalFiles] = useState<number>(0);
+  const [searchTotalFiles, setSearchTotalFiles] = useState<number>(0);
+  const [searchOffset, setSearchOffset] = useState<number>(0);
+  const searchLimit = 20;
+  const [isLoadingSearchPage, setIsLoadingSearchPage] = useState(false);
+
+  const fetchSearchPage = async (offset: number) => {
+    if (!debouncedSearchQuery.trim()) return;
+    setIsLoadingSearchPage(true);
+    try {
+      const q = encodeURIComponent(debouncedSearchQuery);
+      const res = await fetch(`/api/search?q=${q}${forumId ? `&forumId=${forumId}` : ''}&limit=${searchLimit}&offset=${offset}`);
+      if (!res.ok) throw new Error('Failed to fetch search results');
+      const data = await res.json();
+      // data.files, data.totalFiles, data.forums, data.messages
+      // Append new files while deduping
+      setSearchFiles(prev => {
+        const map: Record<string, any> = {};
+        prev.forEach(f => { map[f.id] = f; });
+        (data.files || []).forEach((f: any) => { map[f.id] = map[f.id] || f; });
+        // Maintain ordering by uploadedAt desc
+        return Object.values(map).sort((a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+      });
+      // Start prefetching details for incoming files if necessary
+      (data.files || []).forEach((f: any) => fetchAndMergeFile(f));
+      setSearchLocalTotalFiles(data.totalFiles || 0);
+      setSearchOffset(offset + (data.files || []).length);
+    } catch (err) {
+      console.error('Search page fetch failed', err);
+    } finally {
+      setIsLoadingSearchPage(false);
+    }
+  };
+
+  // Reset and load first page when query changes
+  useEffect(() => {
+    if (!debouncedSearchQuery.trim()) {
+      setSearchFiles([]);
+      setSearchLocalTotalFiles(0);
+      setSearchExtractedTotalFiles(0);
+      setSearchTotalFiles(0);
+      setSearchOffset(0);
+      return;
+    }
+    setSearchFiles([]);
+    setSearchLocalTotalFiles(0);
+    setSearchExtractedTotalFiles(0);
+    setSearchTotalFiles(0);
+    setSearchOffset(0);
+    fetchSearchPage(0);
+  }, [debouncedSearchQuery, forumId]);
+
+  // Recalculate the combined total whenever local/extracted totals change
+  useEffect(() => {
+    setSearchTotalFiles((searchLocalTotalFiles || 0) + (searchExtractedTotalFiles || 0));
+  }, [searchLocalTotalFiles, searchExtractedTotalFiles]);
+
+  // Load more search results
+  const loadMoreSearchResults = async () => {
+    if (isLoadingSearchPage) return;
+    await fetchSearchPage(searchOffset);
+  };
+
+  // Extracted (neon) DB search for live updates or Xmaster forum
+  const { data: extractedSearchResults, isLoading: isSearchingExtracted } = useQuery({
+    queryKey: ["/api/search/extracted", debouncedSearchQuery, forumId],
+    queryFn: async () => {
+      const q = encodeURIComponent(debouncedSearchQuery);
+      const res = await fetch(`/api/search/extracted?q=${q}${forumId ? `&forumId=${forumId}` : ''}`);
+      if (!res.ok) throw new Error('Failed to fetch extracted search results');
+      return res.json();
+    },
+    enabled: !!debouncedSearchQuery.trim() && includeExtracted,
+    onSuccess: (data) => {
+      console.log('[ForumPage] Extracted search results loaded:', data);
+      // Merge extracted results and update extracted total
+      if (data && Array.isArray(data.files)) {
+        setSearchFiles(prev => {
+          const map: Record<string, any> = {};
+          prev.forEach(f => { map[f.id] = f; });
+          (data.files || []).forEach((f: any) => { map[f.id] = map[f.id] || f; });
+          return Object.values(map).sort((a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+        });
+      }
+      // Prefetch details for each extracted file (no-op for extracted but keeps UI consistent)
+      (data.files || []).forEach((f: any) => fetchAndMergeFile(f));
+      setSearchExtractedTotalFiles(data.totalFiles || 0);
+    },
+    onError: (error) => console.log('[ForumPage] Extracted search error:', error),
+  });
+
+  const [streamedExtractedResults, setStreamedExtractedResults] = useState<any[]>([]);
+  const extractedSSERef = useRef<EventSource | null>(null);
+  const [isStreamingExtracted, setIsStreamingExtracted] = useState(false);
+  const [streamedLocalResults, setStreamedLocalResults] = useState<any[]>([]);
+  const localSSERef = useRef<EventSource | null>(null);
+  const [isStreamingLocal, setIsStreamingLocal] = useState(false);
+
+  // Setup SSE streaming for extracted DB search
+  useEffect(() => {
+    // Close existing SSE if any
+    if (extractedSSERef.current) {
+      extractedSSERef.current.close();
+      extractedSSERef.current = null;
+    }
+    setStreamedExtractedResults([]);
+
+    if (!debouncedSearchQuery.trim() || !includeExtracted) return;
+
+    const q = encodeURIComponent(debouncedSearchQuery);
+    const url = `/api/search/extracted/stream?q=${q}${forumId ? `&forumId=${forumId}` : ''}`;
+    try {
+      setIsStreamingExtracted(true);
+      const es = new EventSource(url);
+      extractedSSERef.current = es;
+      es.onmessage = (ev) => {
+        try {
+          const parsed = JSON.parse(ev.data);
+          if (parsed && parsed.type === 'file' && parsed.data) {
+            // Merge and fetch details as needed
+            fetchAndMergeFile(parsed.data);
+          }
+        } catch (err) {
+          console.error('Failed to parse SSE message', err);
+        }
+      };
+      // Listen for count events to show incremental totals
+      es.addEventListener('count', (ev: MessageEvent) => {
+        try {
+          const payload = JSON.parse((ev as any).data || '{}');
+          if (payload && typeof payload.count === 'number') {
+            setSearchExtractedTotalFiles(payload.count);
+          }
+        } catch (err) {
+          console.warn('Failed to parse extracted count event', err);
+        }
+      });
+      es.addEventListener('done', () => {
+        es.close();
+        extractedSSERef.current = null;
+        setIsStreamingExtracted(false);
+      });
+      es.onerror = (e) => {
+        console.warn('Extracted SSE error', e);
+        es.close();
+        extractedSSERef.current = null;
+        setIsStreamingExtracted(false);
+      };
+    } catch (e) {
+      console.error('Failed to open extracted SSE', e);
+    }
+    return () => {
+      if (extractedSSERef.current) {
+        extractedSSERef.current.close();
+        extractedSSERef.current = null;
+      }
+    };
+  }, [debouncedSearchQuery, includeExtracted, forumId]);
+
+  // Setup SSE streaming for local DB search results
+  useEffect(() => {
+    if (localSSERef.current) {
+      localSSERef.current.close();
+      localSSERef.current = null;
+    }
+    setStreamedLocalResults([]);
+
+    if (!debouncedSearchQuery.trim()) return;
+    const q = encodeURIComponent(debouncedSearchQuery);
+    const url = `/api/search/stream?q=${q}${forumId ? `&forumId=${forumId}` : ''}`;
+    try {
+      setIsStreamingLocal(true);
+      const es = new EventSource(url);
+      localSSERef.current = es;
+      es.onmessage = (ev) => {
+        try {
+          const parsed = JSON.parse(ev.data);
+          if (parsed && parsed.type === 'file' && parsed.data) {
+            // Merge and fetch details as needed
+            fetchAndMergeFile(parsed.data);
+          }
+        } catch (err) {
+          console.error('Failed to parse local SSE message', err);
+        }
+      };
+      // Listen for count events from local SSE
+      es.addEventListener('count', (ev: MessageEvent) => {
+        try {
+          const payload = JSON.parse((ev as any).data || '{}');
+          if (payload && typeof payload.count === 'number') {
+            setSearchLocalTotalFiles(payload.count);
+          }
+        } catch (err) {
+          console.warn('Failed to parse local count event', err);
+        }
+      });
+      es.addEventListener('done', () => { es.close(); localSSERef.current = null; setIsStreamingLocal(false); });
+      es.onerror = (e) => { console.warn('Local SSE error', e); es.close(); localSSERef.current = null; setIsStreamingLocal(false); };
+    } catch (e) {
+      console.error('Failed to open local SSE', e);
+    }
+    return () => {
+      if (localSSERef.current) {
+        localSSERef.current.close();
+        localSSERef.current = null;
+      }
+    };
+  }, [debouncedSearchQuery, forumId]);
+
+  // Merge streamed SSE results into paginated search list as they arrive
+  useEffect(() => {
+    if (!debouncedSearchQuery.trim()) return;
+    if (streamedLocalResults.length === 0 && streamedExtractedResults.length === 0) return;
+
+    setSearchFiles(prev => {
+      const map: Record<string, any> = {};
+      prev.forEach(f => { map[f.id] = f; });
+      // Prepend streamed results so they appear at top
+      [...streamedExtractedResults, ...streamedLocalResults].forEach((f: any) => {
+        if (!map[f.id]) map[f.id] = f;
+      });
+      return Object.values(map).sort((a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+    });
+  }, [streamedLocalResults, streamedExtractedResults, debouncedSearchQuery]);
+
+  // Keep a ref of IDs being fetched to avoid duplicate fetches
+  const fetchingFileIdsRef = useRef<Set<string>>(new Set());
+
+  // Helper: fetch full file details and merge into the search results
+  const fetchAndMergeFile = async (incoming: any) => {
+    if (!incoming || !incoming.id) return;
+    const id = incoming.id;
+    // If it's extracted, the SSE data already has enough info; still merge but don't fetch
+    const isExtracted = id.startsWith('extracted_');
+    // If we already have a file with chunks or directDownloadUrl present, skip fetching
+    const existing = searchFiles.find(f => f.id === id) || streamedLocalResults.find(f => f.id === id) || streamedExtractedResults.find(f => f.id === id);
+    if (existing && (existing.chunks?.length > 0 || existing.directDownloadUrl || isExtracted)) {
+      // Merge incoming minimally if needed and return
+      setSearchFiles(prev => {
+        const map: Record<string, any> = {};
+        prev.forEach(f => map[f.id] = f);
+        if (!map[id]) map[id] = incoming;
+        return Object.values(map).sort((a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+      });
+      return;
+    }
+
+    if (isExtracted) {
+      // Merge extracted file object as-is
+      setSearchFiles(prev => {
+        const map: Record<string, any> = {};
+        prev.forEach(f => map[f.id] = f);
+        map[id] = incoming;
+        return Object.values(map).sort((a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+      });
+      return;
+    }
+
+    // For local files, fetch full details from server to include chunks etc.
+    if (fetchingFileIdsRef.current.has(id)) return;
+    fetchingFileIdsRef.current.add(id);
+    try {
+      const res = await fetch(`/api/files/${id}`);
+      if (!res.ok) {
+        // If server doesn't have full file route available, fall back to merging incoming
+        setSearchFiles(prev => {
+          const map: Record<string, any> = {};
+          prev.forEach(f => map[f.id] = f);
+          map[id] = map[id] || incoming;
+          return Object.values(map).sort((a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+        });
+        return;
+      }
+      const fullFile = await res.json();
+      setSearchFiles(prev => {
+        const map: Record<string, any> = {};
+        prev.forEach(f => map[f.id] = f);
+        map[id] = { ...map[id], ...fullFile };
+        return Object.values(map).sort((a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+      });
+    } catch (err) {
+      console.warn('Failed to fetch file details for', id, err);
+      setSearchFiles(prev => {
+        const map: Record<string, any> = {};
+        prev.forEach(f => map[f.id] = f);
+        map[id] = map[id] || incoming;
+        return Object.values(map).sort((a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+      });
+    } finally {
+      fetchingFileIdsRef.current.delete(id);
+    }
+  };
 
   // Fetch specific file when file parameter is present
   const { data: specificFile, isLoading: specificFileLoading } = useQuery<FileWithChunks>({
@@ -201,11 +511,26 @@ export default function ForumPage() {
     setFilesOffset(prev => prev + filesLimit);
   };
 
-  // Get forum tags for SEO
-  const { selectedTags: forumTags } = forumId ? useEntityTagManager('forum', forumId) : { selectedTags: [] };
+  useEffect(() => {
+    if (!forumId) return;
+    const fetchCounts = async () => {
+      try {
+        const res = await fetch(`/api/forums/${forumId}/files/count`);
+        if (!res.ok) throw new Error('Failed to fetch file counts');
+        const data = await res.json();
+        setTotalFilesCount(data.total || 0);
+        setExtractedFilesCount(data.extractedCount || 0);
+      } catch (err) {
+        console.error('Failed to fetch file counts:', err);
+      }
+    };
+    fetchCounts();
+  }, [forumId, filesOffset]);
 
-  // Get all available tags for filtering
-  const { data: allTags = [] } = useTags();
+  // Do not eagerly fetch all forum tags on page load (can be expensive).
+  // `ForumTagsSection` will fetch tags on demand when editing.
+  const forumTags: any[] = [];
+
 
   // Initialize messages from query data
   useEffect(() => {
@@ -276,9 +601,29 @@ export default function ForumPage() {
       } else if (data.type === "file_uploaded" && data.forumId === forumId) {
         // Refresh files list when a new file is uploaded
         console.log("File uploaded:", data.file);
-        queryClient.invalidateQueries({ queryKey: ["/api/forums", forumId, "files"] });
+        // Invalidate any files query for this forum (supports paginated keys)
+        queryClient.invalidateQueries({ predicate: (query) => {
+          const k = query.queryKey as any[];
+          return Array.isArray(k) && k[0] === "/api/forums" && k[1] === forumId && k[2] === "files";
+        }});
         // Also refresh partial uploads as one might have completed
         queryClient.invalidateQueries({ queryKey: ["/api/partial-uploads"] });
+        // Optimistically merge the file into the local files list
+        if (data.file) {
+          setAllFiles(prev => {
+            if (prev.some(f => f.id === data.file.id)) return prev;
+            return [data.file, ...prev];
+          });
+        }
+      } else if (data.type === "file_deleted" && data.forumId === forumId) {
+        console.log('File deleted:', data.fileId);
+        // Invalidate file queries for this forum
+        queryClient.invalidateQueries({ predicate: (query) => {
+          const k = query.queryKey as any[];
+          return Array.isArray(k) && k[0] === "/api/forums" && k[1] === forumId && k[2] === "files";
+        }});
+        // Remove from local list immediately for snappy UI
+        setAllFiles(prev => prev.filter(f => f.id !== data.fileId));
       } else if (data.type === "member_added" && data.forumId === forumId) {
         // Refresh members list when a new member is added
         console.log("Member added:", data);
@@ -358,57 +703,53 @@ export default function ForumPage() {
     setPreviewOpen(true);
   };
 
+  // Close overlays when navigating away (popstate/back button) or when forumId clears
+  useEffect(() => {
+    const onPop = () => {
+      setShowPeoplePanel(false);
+      setPreviewOpen(false);
+      setShowFileUpload(false);
+      setEditingForumTags(false);
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
+  useEffect(() => {
+    if (!forumId) {
+      setShowPeoplePanel(false);
+      setPreviewOpen(false);
+      setShowFileUpload(false);
+      setEditingForumTags(false);
+    }
+  }, [forumId]);
+
   const handleClosePreview = () => {
     setPreviewOpen(false);
     setPreviewFile(null);
   };
 
-  // Prepare entities for batch tag fetching when filtering is active
-  const allEntities = React.useMemo(() => {
-    const entities: Array<{ type: string; id: string }> = [];
-    if (messages) {
-      messages.forEach(msg => entities.push({ type: 'message', id: msg.id }));
+  const handleBack = (e?: React.MouseEvent) => {
+    e?.preventDefault();
+    // Prefer history.back when possible (preserves navigation history on mobile)
+    if (window.history.length > 1) {
+      window.history.back();
+      return;
     }
-    if (files) {
-      files.forEach(file => entities.push({ type: 'file', id: file.id }));
-    }
-    return entities;
-  }, [messages, files]);
+    // Fallback to navigating to home
+    setLocation('/');
+  };
 
-  // Fetch tags for all entities when filtering is active
-  const { data: entityTagsMap = {} } = useMultipleEntityTags(
-    selectedFilterTagIds.length > 0 ? allEntities : []
-  );
+  // Tag-based filtering removed — no entity tag fetching needed
 
   // Filter messages and files based on selected tags
   const filteredMessages = React.useMemo(() => {
-    if (selectedFilterTagIds.length === 0) return messages || [];
-
-    return (messages || []).filter(message => {
-      const messageTags = entityTagsMap[`message-${message.id}`] || [];
-      const messageTagIds = messageTags.map(tag => tag.id);
-      return selectedFilterTagIds.some(tagId => messageTagIds.includes(tagId));
-    });
-  }, [messages, selectedFilterTagIds, entityTagsMap]);
+    return messages || [];
+  }, [messages]);
 
   const filteredFiles = React.useMemo(() => {
-    if (selectedFilterTagIds.length === 0) return allFiles;
-
-    return allFiles.filter(file => {
-      const fileTags = entityTagsMap[`file-${file.id}`] || [];
-      const fileTagIds = fileTags.map(tag => tag.id);
-      
-      // For extracted files, also check the tags property
-      if (file.id.startsWith('extracted_') && (file as any).tags) {
-        const extractedTagIds = (file as any).tags.map((tagName: string) => 
-          `extracted_${tagName.toLowerCase().replace(/\s+/g, '_')}`
-        );
-        fileTagIds.push(...extractedTagIds);
-      }
-      
-      return selectedFilterTagIds.some(tagId => fileTagIds.includes(tagId));
-    });
-  }, [allFiles, selectedFilterTagIds, entityTagsMap]);
+    return allFiles;
+  }, [allFiles]);
 
   // Apply search filtering to already tag-filtered results
   const searchFilteredMessages = React.useMemo(() => {
@@ -423,7 +764,7 @@ export default function ForumPage() {
       return filteredMessages.filter(message => {
         return (
           message.content.toLowerCase().includes(query) ||
-          message.user.username.toLowerCase().includes(query)
+          (message.user?.username || '').toLowerCase().includes(query)
         );
       });
     }
@@ -434,20 +775,32 @@ export default function ForumPage() {
   const searchFilteredFiles = React.useMemo(() => {
     console.log('[ForumPage] searchFilteredFiles computing, debouncedSearchQuery:', debouncedSearchQuery, 'searchResults:', searchResults);
     if (debouncedSearchQuery.trim()) {
-      // When searching, use search results if available, otherwise filter loaded files
-      const searchFiles = searchResults?.files || [];
-      if (searchFiles.length > 0) {
-        // Filter search results to only show files from the current forum, but include all extracted files
+      // When searching, use paginated backend searchFiles (merged local + extracted) if available
+      if (searchFiles && searchFiles.length > 0) {
         const forumSearchFiles = searchFiles.filter(f => f.id.startsWith('extracted_') || f.forumId === forumId);
-        console.log('[ForumPage] Using backend search results (filtered to forum):', forumSearchFiles.map(f => ({ id: f.id, name: f.fileName, tags: f.extractedTags })));
+        console.log('[ForumPage] Using paginated backend search results (filtered to forum):', forumSearchFiles.map(f => ({ id: f.id, name: f.fileName, tags: f.extractedTags })));
         return forumSearchFiles;
       }
+
+      // Fall back to older combined immediate results if present
+      const searchFilesFallback = [...(searchResults?.files || []), ...streamedLocalResults, ...(extractedSearchResults?.files || []), ...streamedExtractedResults];
+      if (searchFilesFallback.length > 0) {
+        const dedupedMap: Record<string, any> = {};
+        for (const f of searchFilesFallback) {
+          dedupedMap[f.id] = f;
+        }
+        const uniqueSearchFiles = Object.values(dedupedMap);
+        const forumSearchFiles = uniqueSearchFiles.filter(f => f.id.startsWith('extracted_') || f.forumId === forumId);
+        console.log('[ForumPage] Using backend fallback search results (filtered to forum):', forumSearchFiles.map(f => ({ id: f.id, name: f.fileName, tags: f.extractedTags })));
+        return forumSearchFiles;
+      }
+
       // Fall back to filtering loaded files if search didn't return results
       const query = debouncedSearchQuery.toLowerCase().trim();
       const filtered = allFiles.filter(file => {
         return (
           file.fileName.toLowerCase().includes(query) ||
-          file.user.username.toLowerCase().includes(query) ||
+          (file.user?.username || file.adminCreatedBy || '').toLowerCase().includes(query) ||
           (file.extractedTags || []).some((tag: string) => tag.toLowerCase().includes(query))
         );
       });
@@ -456,7 +809,7 @@ export default function ForumPage() {
     }
     console.log('[ForumPage] No search query, showing filteredFiles:', filteredFiles.map(f => ({ id: f.id, name: f.fileName, tags: f.extractedTags })));
     return filteredFiles;
-  }, [filteredFiles, debouncedSearchQuery, searchResults, allFiles, forumId]);
+  }, [filteredFiles, debouncedSearchQuery, searchResults, extractedSearchResults, allFiles, forumId]);
 
   // Forum Tags Section Component
   const ForumTagsSection = ({
@@ -471,12 +824,12 @@ export default function ForumPage() {
     onEditingChange: (editing: boolean) => void;
   }) => {
     const {
-      selectedTags,
-      availableTags,
+      selectedTags = [],
+      availableTags = [],
       handleTagsChange,
       handleCreateTag,
       isUpdating,
-    } = useEntityTagManager('forum', forumId);
+    } = useEntityTagManager('forum', forumId, { includeExtracted: editing }) || {};
 
     if (editing) {
       return (
@@ -553,11 +906,9 @@ export default function ForumPage() {
         <div className="container mx-auto px-4 py-4">
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div className="flex items-center gap-4 w-full md:w-auto">
-              <Link href="/">
-                <Button variant="ghost" size="icon" data-testid="button-back" className="shrink-0 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-900">
-                  <ArrowLeft className="h-5 w-5" />
-                </Button>
-              </Link>
+              <Button onClick={handleBack} variant="ghost" size="icon" data-testid="button-back" className="shrink-0 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-900">
+                <ArrowLeft className="h-5 w-5" />
+              </Button>
               <div className="min-w-0 flex-1">
                 <h1 className="text-xl font-semibold truncate text-zinc-100">{forum.name}</h1>
                 {forum.description && (
@@ -600,7 +951,42 @@ export default function ForumPage() {
               {searchQuery && (
                 <Badge variant="secondary" className="text-xs shrink-0 hidden sm:inline-flex bg-zinc-900 text-zinc-400 border-zinc-800">
                   {searchFilteredMessages.length + searchFilteredFiles.length} results
+                  {isSearchingExtracted && (
+                    <span className="ml-2 inline-block animate-spin rounded-full h-3 w-3 border-b-2 border-zinc-700"></span>
+                  )}
                 </Badge>
+              )}
+              {debouncedSearchQuery.trim() && searchFiles.length > 0 && (
+                <div className="ml-2 text-xs text-muted-foreground hidden sm:flex items-center">
+                  Showing <span className="font-medium text-zinc-100 mx-1">{searchFiles.length}</span> of <span className="font-medium text-zinc-100 mx-1">{searchTotalFiles}</span>
+                </div>
+              )}
+              {/* Load more button for paginated search results */}
+              {debouncedSearchQuery.trim() && searchFiles.length > 0 && searchFiles.length < searchTotalFiles && (
+                <>
+                  <div className="ml-2 hidden sm:block">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={loadMoreSearchResults}
+                      disabled={isLoadingSearchPage}
+                      className="rounded-full px-3 py-1 text-xs"
+                    >
+                      {isLoadingSearchPage ? 'Loading...' : `Load more (${Math.min(searchLimit, searchTotalFiles - searchFiles.length)})`}
+                    </Button>
+                  </div>
+                  <div className="mt-2 sm:hidden w-full">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={loadMoreSearchResults}
+                      disabled={isLoadingSearchPage}
+                      className="w-full rounded-full px-3 py-2 text-sm"
+                    >
+                      {isLoadingSearchPage ? 'Loading...' : `Load more (${Math.min(searchLimit, searchTotalFiles - searchFiles.length)})`}
+                    </Button>
+                  </div>
+                </>
               )}
               <Button
                 variant="ghost"
@@ -635,15 +1021,7 @@ export default function ForumPage() {
               >
                 Files ({searchFilteredFiles.length})
               </Button>
-              {/* Tag Filter Button inline with tabs, styled as tab */}
-              <div className="ml-2">
-                <TagFilter
-                  availableTags={allTags}
-                  selectedTagIds={selectedFilterTagIds}
-                  onTagSelectionChange={setSelectedFilterTagIds}
-                  className={`rounded-none border-b-2 hover:bg-zinc-900 ${viewMode === "tags" ? "border-zinc-100 text-zinc-100" : "border-transparent text-zinc-400 hover:text-zinc-100"}`}
-                />
-              </div>
+              {/* Tag filter removed */}
             </div>
           </div>
         </div>
@@ -656,7 +1034,10 @@ export default function ForumPage() {
         {viewMode === "timeline" ? (
           <>
             {/* Unified Timeline */}
-            {messagesLoading || (filesLoading && filesOffset === 0) || isSearching ? (
+            {/* Show skeletons only when initial data is still loading and there are no partial/streamed
+               search results available. This lets streamed files appear immediately while the full
+               backend search (which may take long) runs in the background. */}
+            {messagesLoading || (filesLoading && filesOffset === 0) || (isSearching && searchFilteredMessages.length === 0 && searchFilteredFiles.length === 0) ? (
               <div className="flex-1 overflow-y-auto p-4 space-y-4 pb-24">
                 {[...Array(5)].map((_, i) => (
                   <div key={i} className="flex gap-3">
@@ -681,6 +1062,8 @@ export default function ForumPage() {
                   onLoadMore={loadMoreFiles}
                   hasMore={hasMoreFiles}
                   isLoadingMore={filesLoading && filesOffset > 0 && !searchQuery.trim()}
+                  totalFiles={totalFilesCount}
+                  extractedCount={extractedFilesCount}
                 />
               </div>
             )}
@@ -732,11 +1115,20 @@ export default function ForumPage() {
             />
 
             {hasMoreFiles && !filesLoading && !searchQuery.trim() && (
-              <div className="flex justify-center mt-6">
+              <div className="w-full flex flex-col sm:flex-row items-center justify-center gap-3 mt-6" aria-live="polite">
+                <div className="flex items-center gap-3 bg-gradient-to-r from-zinc-900 to-zinc-800 border border-zinc-800 px-3 py-2 rounded-full shadow-sm">
+                  <FileText className="h-4 w-4 text-muted-foreground" />
+                  <div className="text-[11px] text-muted-foreground leading-none uppercase tracking-wide">Total files</div>
+                  <div className="text-lg sm:text-xl font-semibold text-zinc-100">{totalFilesCount}</div>
+                </div>
+                {typeof extractedFilesCount === 'number' && extractedFilesCount > 0 && (
+                  <div className="text-xs text-muted-foreground">Includes <span className="font-medium text-zinc-100">{extractedFilesCount}</span> extracted</div>
+                )}
+                <div className="text-xs text-muted-foreground">Showing <span className="font-medium text-zinc-100">{allFiles.length}</span> files</div>
                 <Button
                   onClick={loadMoreFiles}
                   variant="outline"
-                  className="bg-zinc-800 border-zinc-700 hover:bg-zinc-700"
+                  className="bg-zinc-800 border-zinc-700 hover:bg-zinc-700 min-w-[140px] rounded-full px-4"
                 >
                   Load More Files
                 </Button>

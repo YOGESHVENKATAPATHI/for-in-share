@@ -28,9 +28,9 @@ export function VideoThumbnail({
   const [isPlayerReady, setIsPlayerReady] = useState(false);
 
   const sizeClasses = {
-    sm: "w-16 h-16",
-    md: "w-32 h-24",
-    lg: "w-48 h-32"
+    sm: "w-24 h-28",
+    md: "w-36 h-30",
+    lg: "w-56 h-36"
   };
 
   useEffect(() => {

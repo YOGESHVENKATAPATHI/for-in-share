@@ -12,10 +12,11 @@ import { setupAuth } from "./auth";
 import { storage } from "./storage";
 import { dropboxManager } from "./dropbox-manager";
 import { dbManager } from "./db";
-import { insertForumSchema, insertMessageSchema, insertCommentSchema, insertAccessRequestSchema } from "@shared/schema";
+import { insertForumSchema, insertMessageSchema, insertCommentSchema, insertAccessRequestSchema, users, forums, forumMembers, messages, files, fileTags, tags, messageTags, forumTags } from "@shared/schema";
 import { fromZodError } from "zod-validation-error";
 import fetch from "node-fetch";
 import { keepAliveService } from "./keep-alive";
+import { eq, and, or, ilike, exists, isNotNull, sql } from "drizzle-orm";
 import { distributedChunkManager } from "./distributed-chunk-manager";
 // Transcoding removed - using direct streaming only
 import { globalPriorityProcessor } from "./priority-chunk-processor";
@@ -347,36 +348,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Upload server registration and discovery endpoints
-  app.post("/api/upload-servers/register", async (req, res) => {
-    try {
-      const { serverId, url, region, capabilities } = req.body;
-      
-      if (!serverId || !url) {
-        return res.status(400).json({
-          error: "Server ID and URL are required"
-        });
-      }
-
-      // Add to distributed chunk manager
-      const success = distributedChunkManager.addServer(url, {
-        maxJobs: capabilities?.maxConcurrentUploads || 5,
-        region: region || 'unknown'
-      });
-
-      console.log(`📡 Upload server registration: ${serverId} at ${url} - ${success ? 'Success' : 'Failed'}`);
-
-      res.json({
-        success,
-        serverId,
-        message: success ? 'Server registered successfully' : 'Server registration failed'
-      });
-    } catch (error: any) {
-      res.status(500).json({
-        error: "Failed to register upload server",
-        message: error.message
-      });
-    }
-  });
 
   app.get("/api/upload-servers/list", (req, res) => {
     try {
@@ -714,6 +685,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const files = await storage.getFiles(req.params.id, limit, offset);
       res.json(files);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Get total file count for forum (includes extracted count for Xmaster)
+  app.get("/api/forums/:id/files/count", optionalAuth, async (req, res, next) => {
+    try {
+      const forum = await storage.getForumById(req.params.id);
+      if (!forum) return res.status(404).send("Forum not found");
+
+      // Check access
+      if (!forum.isPublic) {
+        if (!req.isAuthenticated?.() || !req.user) return res.sendStatus(401);
+        const isMember = await storage.isForumMember(forum.id, req.user.id);
+        if (!isMember) return res.status(403).send("Access denied");
+      }
+
+      const counts = await storage.getFilesCount(req.params.id);
+      res.json(counts);
     } catch (error) {
       next(error);
     }
@@ -1274,69 +1265,29 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Get single file by ID
-  app.get("/api/files/:id", optionalAuth, async (req, res) => {
+  // Get full file metadata and details (includes chunks for local files)
+  app.get('/api/files/:id', optionalAuth, async (req, res, next) => {
     try {
-      const file = await storage.getFileById(req.params.id);
-      if (!file) {
-        return res.status(404).json({ error: "File not found" });
-      }
+      const id = req.params.id;
+      const file = await storage.getFileById(id);
+      if (!file) return res.status(404).json({ error: 'File not found' });
 
-      // Check forum access
-      const isExtractedFile = req.params.id.startsWith('extracted_');
-      const forum = await storage.getForumById(file.forumId);
-      if (!forum && !isExtractedFile) {
-        return res.status(404).json({ error: "Forum not found" });
-      }
-
-      if (!forum?.isPublic && !isExtractedFile) {
-        if (!req.isAuthenticated?.() || !req.user) {
-          return res.status(401).json({ error: "Authentication required" });
+      // Access check: verify forum membership if forum is private
+      try {
+        const forum = await storage.getForumById(file.forumId);
+        if (forum && !forum.isPublic) {
+          if (!req.isAuthenticated?.() || !req.user) return res.sendStatus(401);
+          const isMember = await storage.isForumMember(forum.id, req.user.id);
+          const isCreator = forum.creatorId === req.user.id;
+          if (!isMember && !isCreator) return res.status(403).json({ error: 'Access denied' });
         }
-        const isMember = await storage.isForumMember(forum.id, req.user.id);
-        if (!isMember) {
-          return res.status(403).json({ error: "Access denied" });
-        }
-      } else if (isExtractedFile) {
-        // Extracted files require authentication but not forum membership
-        if (!req.isAuthenticated?.() || !req.user) {
-          return res.status(401).json({ error: "Authentication required" });
-        }
+      } catch (e) {
+        // If forum lookup fails, continue; non-fatal
       }
 
       res.json(file);
-    } catch (error: any) {
-      console.error("File request error:", error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // Get related files based on tags
-  app.get("/api/files/:id/related", optionalAuth, async (req, res) => {
-    try {
-      const file = await storage.getFileById(req.params.id);
-      if (!file) {
-        return res.status(404).json({ error: "File not found" });
-      }
-
-      // Get tags for this file
-      const fileTags = await storage.getEntityTags('file', req.params.id);
-      const tagIds = fileTags.map(tag => tag.id);
-
-      if (tagIds.length === 0) {
-        return res.json([]);
-      }
-
-      // Find other files with similar tags
-      const relatedFiles = await storage.getFilesByTags(tagIds, req.params.id);
-      
-      // Limit to 5 related files
-      const limitedRelatedFiles = relatedFiles.slice(0, 5);
-
-      res.json(limitedRelatedFiles);
-    } catch (error: any) {
-      console.error("Related files request error:", error);
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      next(error);
     }
   });
 
@@ -1407,45 +1358,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Get priority chunk status
-  app.get("/api/files/:id/priority-status", requireAuth, async (req, res, next) => {
-    try {
-      const fileId = req.params.id;
-      
-      const file = await storage.getFileById(fileId);
-      if (!file) {
-        return res.status(404).json({ error: "File not found" });
-      }
-      
-      // Check access permissions
-      if (!file.isPublic) {
-        const user = req.user as SelectUser;
-        if (!user) {
-          return res.status(401).json({ error: "Authentication required" });
-        }
-        
-        const hasAccess = await storage.isForumMember(file.forumId, user.id);
-        if (!hasAccess) {
-          return res.status(403).json({ error: "Access denied" });
-        }
-      }
-      
-      const processorStatus = globalPriorityProcessor.getStatus();
-      const streamingStatus = globalStreamingProcessor.getStatus?.() || { activeChunks: [], priorityChunks: [] };
-      
-      res.json({
-        fileId,
-        fileName: file.fileName,
-        priorityProcessor: processorStatus,
-        streamingProcessor: streamingStatus,
-        timestamp: Date.now()
-      });
-      
-    } catch (error: any) {
-      console.error("Priority status error:", error);
-      res.status(500).json({ error: error.message });
-    }
-  });
 
   // Get chunk information for smart seeking calculations
   app.get("/api/files/:id/chunk-info", requireAuth, async (req, res, next) => {
@@ -1614,104 +1526,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Immediate chunk processing endpoint for priority requests
-  app.post("/api/files/:id/priority-chunk", requireAuth, async (req, res, next) => {
-    try {
-      const { chunkIndex, forceProcess = true } = req.body;
-      const fileId = req.params.id;
-      
-      if (chunkIndex === undefined || chunkIndex < 0) {
-        return res.status(400).json({ error: "Valid chunk index required" });
-      }
-      
-      const file = await storage.getFileById(fileId);
-      if (!file) {
-        return res.status(404).json({ error: "File not found" });
-      }
-      
-      // Check access permissions
-      if (!file.isPublic) {
-        const user = req.user as SelectUser;
-        if (!user) {
-          return res.status(401).json({ error: "Authentication required" });
-        }
-        
-        const hasAccess = await storage.isForumMember(file.forumId, user.id);
-        if (!hasAccess) {
-          return res.status(403).json({ error: "Access denied" });
-        }
-      }
-      
-      const chunks = file.chunks?.sort((a, b) => a.chunkIndex - b.chunkIndex) || [];
-      const targetChunk = chunks.find(c => c.chunkIndex === chunkIndex);
-      
-      if (!targetChunk) {
-        return res.status(404).json({ error: "Chunk not found" });
-      }
-      
-      console.log(`[PriorityChunk] Processing priority request for chunk ${chunkIndex} of file ${file.fileName}`);
-      
-      // Set this chunk as priority in our streaming processor
-      globalStreamingProcessor.setPriorityChunks([chunkIndex]);
-      
-      try {
-        // Process the chunk with high priority
-        const result = await globalPriorityProcessor.processChunkImmediate(
-          `${fileId}-${chunkIndex}`,
-          chunkIndex,
-          async (signal) => {
-            // Simulate immediate chunk processing
-            await new Promise(resolve => {
-              if (signal.aborted) {
-                throw new Error('Aborted');
-              }
-              
-              // Check if chunk needs processing (in a real scenario, this would check if chunk is already processed/available)
-              setTimeout(() => {
-                if (signal.aborted) {
-                  throw new Error('Aborted');
-                }
-                resolve(null);
-              }, 100); // Small delay to simulate immediate processing
-            });
-            
-            return {
-              chunkId: `${fileId}-${chunkIndex}`,
-              chunkIndex,
-              processed: true,
-              timestamp: Date.now()
-            };
-          },
-          {
-            priority: 'high',
-            cancelOthers: forceProcess,
-            timeout: 15000 // 15 second timeout for chunk processing
-          }
-        );
-        
-        console.log(`[PriorityChunk] Successfully processed priority chunk ${chunkIndex} for file ${file.fileName}`);
-        
-        res.json({
-          success: true,
-          message: `Chunk ${chunkIndex} processed with high priority`,
-          result,
-          streamUrl: `/api/files/${fileId}/stream?chunk=${chunkIndex}&priority=true`
-        });
-        
-      } catch (error: any) {
-        console.error(`[PriorityChunk] Failed to process priority chunk ${chunkIndex}:`, error);
-        res.status(500).json({
-          success: false,
-          error: "Failed to process priority chunk",
-          message: error.message
-        });
-      }
-      
-    } catch (error: any) {
-      console.error("Priority chunk processing error:", error);
-      res.status(500).json({ error: error.message });
-    }
-  });
+
 
   // Smart streaming endpoint for optimized seeking
   // On-the-fly transcoding endpoint removed - using direct streaming only
@@ -3216,6 +3031,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Delete from database
       await storage.deleteFile(file.id);
 
+      // Broadcast file deletion to all clients (so UI can refresh)
+      clients.forEach((c) => {
+        if (c.ws.readyState === WebSocket.OPEN) {
+          c.ws.send(JSON.stringify({
+            type: 'file_deleted',
+            forumId: file.forumId,
+            fileId: file.id
+          }));
+        }
+      });
+
       res.sendStatus(200);
     } catch (error) {
       next(error);
@@ -3267,6 +3093,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const file = files.find(f => f.fileName === partialUpload.fileName && f.fileSize === partialUpload.fileSize);
       if (file) {
         await storage.deleteFile(file.id);
+        // Broadcast deletion so clients update
+        clients.forEach((c) => {
+          if (c.ws.readyState === WebSocket.OPEN) {
+            c.ws.send(JSON.stringify({
+              type: 'file_deleted',
+              forumId: partialUpload.forumId,
+              fileId: file.id
+            }));
+          }
+        });
       }
 
       // Delete partial upload record
@@ -3820,7 +3656,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Tags routes
   app.get("/api/tags", optionalAuth, async (req, res, next) => {
     try {
-      const tags = await storage.getTags();
+      const includeExtracted = String(req.query.includeExtracted || 'false') === 'true';
+      const tags = await storage.getTags(includeExtracted);
       res.json(tags);
     } catch (error) {
       next(error);
@@ -4165,17 +4002,320 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.log(`[API] Starting comprehensive search across extracted databases and local databases...`);
       const startTime = Date.now();
       
-      const results = await storage.searchEntities(query, req.user?.id);
-      
+      const forumId = req.query.forumId as string | undefined;
+      const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit || '20'), 10)));
+      const offset = Math.max(0, parseInt(String(req.query.offset || '0'), 10));
+
+      // Perform local search and extracted search, then merge and paginate files
+      const localResults = await storage.searchEntities(query, req.user?.id, forumId);
+      const extractedFiles = await storage.searchExtractedFiles(query, forumId);
+
+      // Merge files, dedupe by id, sort by uploadedAt desc
+      const allFilesMap: Record<string, any> = {};
+      for (const f of [...localResults.files, ...extractedFiles]) {
+        allFilesMap[f.id] = f;
+      }
+      const mergedFiles = Object.values(allFilesMap).sort((a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+
+      const totalFiles = mergedFiles.length;
+      const paginatedFiles = mergedFiles.slice(offset, offset + limit);
+
       const duration = Date.now() - startTime;
-      console.log(`[API] Search completed: query="${query}", results=forums:${results.forums.length} files:${results.files.length} messages:${results.messages.length}, duration=${duration}ms`);
-      
-      // Log breakdown of results by type
-      const extractedFiles = results.files.filter(f => f.id.startsWith('extracted_'));
-      const localFiles = results.files.filter(f => !f.id.startsWith('extracted_'));
-      console.log(`[API] Result breakdown: extracted_files:${extractedFiles.length}, local_files:${localFiles.length}, forums:${results.forums.length}, messages:${results.messages.length}`);
-      
-      res.json(results);
+      console.log(`[API] Search completed: query="${query}", totalFiles:${totalFiles}, returned:${paginatedFiles.length}, duration=${duration}ms`);
+
+      res.json({ forums: localResults.forums, messages: localResults.messages, files: paginatedFiles, totalFiles });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Extracted-only search (live updates for extracted DBs)
+  app.get("/api/search/extracted", optionalAuth, async (req, res, next) => {
+    try {
+      const query = req.query.q as string;
+      if (!query) return res.status(400).send('Query is required');
+      const forumId = req.query.forumId as string | undefined;
+      const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit || '20'), 10)));
+      const offset = Math.max(0, parseInt(String(req.query.offset || '0'), 10));
+      const results = await storage.searchExtractedFiles(query, forumId);
+      const totalFiles = results.length;
+      const files = results.sort((a,b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()).slice(offset, offset + limit);
+      res.json({ files, totalFiles });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // SSE Search stream for local DBs
+  app.get('/api/search/stream', optionalAuth, async (req, res, next) => {
+    try {
+      const query = String(req.query.q || '');
+      if (!query) return res.status(400).send('Query required');
+      const forumId = req.query.forumId as string | undefined;
+      const userId = req.user?.id;
+
+      // Check access if forumId is provided
+      if (forumId) {
+        const forum = await storage.getForumById(forumId);
+        if (!forum) return res.status(404).send('Forum not found');
+        if (!forum.isPublic) {
+          if (!req.isAuthenticated?.() || !req.user) return res.sendStatus(401);
+          const isMember = await storage.isForumMember(forumId, req.user.id);
+          if (!isMember) return res.status(403).send('Access denied');
+        }
+      }
+
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+
+      const instances = dbManager.getAllInstances();
+      const shardBatchSize = 5; // small batch for progressive streaming
+
+      // For each instance, query files/messages/forums and stream results as they arrive
+      const lower = `%${query.toLowerCase()}%`;
+      // Keep a running count of streamed local files so clients can show totals progressively
+      let localStreamedCount = 0;
+      for (const instance of instances) {
+        let offset = 0;
+        let more = true;
+        while (more) {
+          try {
+            const fileQueryBatch = instance.db
+              .select({ file: files, user: users, forum: forums })
+              .from(files)
+              .innerJoin(users, eq(files.userId, users.id))
+              .innerJoin(forums, eq(files.forumId, forums.id))
+              .leftJoin(forumMembers, and(eq(forumMembers.forumId, forums.id), userId ? eq(forumMembers.userId, userId) : sql`1=0`))
+              .where(and(
+                or(eq(forums.isPublic, true), userId ? eq(forums.creatorId, userId) : sql`1=0`, userId ? isNotNull(forumMembers.id) : sql`1=0`),
+                or(
+                  ilike(files.fileName, lower),
+                  and(isNotNull(files.metaTitle), ilike(files.metaTitle, lower)),
+                  and(isNotNull(files.metaDescription), ilike(files.metaDescription, lower)),
+                  and(isNotNull(files.keywords), ilike(files.keywords, lower)),
+                  and(isNotNull(files.adminNotes), ilike(files.adminNotes, lower)),
+                  exists(instance.db.select().from(fileTags).innerJoin(tags, eq(fileTags.tagId, tags.id)).where(and(eq(fileTags.fileId, files.id), ilike(tags.name, lower))))
+                )
+              ))
+              .limit(shardBatchSize)
+              .offset(offset);
+            const rows = await fileQueryBatch;
+            for (const r of rows) {
+              const payload = { type: 'file', data: { ...r.file, user: r.user, forum: r.forum } };
+              res.write(`data: ${JSON.stringify(payload)}\n\n`);
+              localStreamedCount++;
+              await new Promise(r => setTimeout(r, 10));
+            }
+            // Emit an updated count event for local streamed files after each batch
+            if (rows.length > 0) {
+              res.write(`event: count\ndata: ${JSON.stringify({ source: 'local', count: localStreamedCount })}\n\n`);
+            }
+            if (rows.length < shardBatchSize) more = false;
+            else offset += shardBatchSize;
+          } catch (err) {
+            console.warn('Search stream shard batch error on', instance.id, err && (err as any).message || err);
+            more = false;
+          }
+        }
+        try {
+          // Files
+          const fileQuery = instance.db
+            .select({ file: files, user: users, forum: forums })
+            .from(files)
+            .innerJoin(users, eq(files.userId, users.id))
+            .innerJoin(forums, eq(files.forumId, forums.id))
+            .leftJoin(forumMembers, and(eq(forumMembers.forumId, forums.id), userId ? eq(forumMembers.userId, userId) : sql`1=0`));
+
+          const lower = `%${query.toLowerCase()}%`;
+          let conditionedFileQuery = fileQuery.where(and(
+            or(eq(forums.isPublic, true), userId ? eq(forums.creatorId, userId) : sql`1=0`, userId ? isNotNull(forumMembers.id) : sql`1=0`),
+            or(
+              ilike(files.fileName, lower),
+              and(isNotNull(files.metaTitle), ilike(files.metaTitle, lower)),
+              and(isNotNull(files.metaDescription), ilike(files.metaDescription, lower)),
+              and(isNotNull(files.keywords), ilike(files.keywords, lower)),
+              and(isNotNull(files.adminNotes), ilike(files.adminNotes, lower)),
+              exists(instance.db.select().from(fileTags).innerJoin(tags, eq(fileTags.tagId, tags.id)).where(and(eq(fileTags.fileId, files.id), ilike(tags.name, lower))))
+            )
+          ));
+          if (forumId) conditionedFileQuery = conditionedFileQuery.where(eq(files.forumId, forumId));
+          const fileRows = await conditionedFileQuery;
+          for (const r of fileRows) {
+            const payload = { type: 'file', data: { ...r.file, user: r.user, forum: r.forum } };
+            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+            localStreamedCount++;
+            await new Promise(r => setTimeout(r, 10));
+          }
+          if (fileRows.length > 0) {
+            res.write(`event: count\ndata: ${JSON.stringify({ source: 'local', count: localStreamedCount })}\n\n`);
+          }
+
+          // Messages
+          const messageQuery = instance.db
+            .select({ message: messages, user: users, forum: forums })
+            .from(messages)
+            .innerJoin(users, eq(messages.userId, users.id))
+            .innerJoin(forums, eq(messages.forumId, forums.id))
+            .leftJoin(forumMembers, and(eq(forumMembers.forumId, forums.id), userId ? eq(forumMembers.userId, userId) : sql`1=0`));
+          let conditionedMessageQuery = messageQuery.where(and(
+            or(eq(forums.isPublic, true), userId ? eq(forums.creatorId, userId) : sql`1=0`, userId ? isNotNull(forumMembers.id) : sql`1=0`),
+            or(
+              ilike(messages.content, lower),
+              exists(instance.db.select().from(messageTags).innerJoin(tags, eq(messageTags.tagId, tags.id)).where(and(eq(messageTags.messageId, messages.id), ilike(tags.name, lower))))
+            )
+          ));
+          if (forumId) conditionedMessageQuery = conditionedMessageQuery.where(eq(messages.forumId, forumId));
+          // Paginate messages in small batches for progressive streaming
+          let msgOffset = 0;
+          let msgMore = true;
+          while (msgMore) {
+            const msgBatch = await conditionedMessageQuery.limit(shardBatchSize).offset(msgOffset);
+            for (const r of msgBatch) {
+              const payload = { type: 'message', data: { ...r.message, user: r.user, forum: r.forum } };
+              res.write(`data: ${JSON.stringify(payload)}\n\n`);
+              await new Promise(r => setTimeout(r, 10));
+            }
+            if (msgBatch.length < shardBatchSize) msgMore = false;
+            else msgOffset += shardBatchSize;
+          }
+
+          // Forums - only search on forum names or descriptions
+          const forumQuery = instance.db
+            .select({ forum: forums })
+            .from(forums)
+            .leftJoin(forumMembers, and(eq(forumMembers.forumId, forums.id), userId ? eq(forumMembers.userId, userId) : sql`1=0`))
+            .where(and(
+              or(eq(forums.isPublic, true), userId ? eq(forums.creatorId, userId) : sql`1=0`, userId ? isNotNull(forumMembers.id) : sql`1=0`),
+              or(ilike(forums.name, lower), ilike(forums.description, lower), exists(instance.db.select().from(forumTags).innerJoin(tags, eq(forumTags.tagId, tags.id)).where(and(eq(forumTags.forumId, forums.id), ilike(tags.name, lower)))))
+            ));
+          const forumRows = await forumQuery.limit(20);
+          for (const r of forumRows) {
+            res.write(`data: ${JSON.stringify({ type: 'forum', data: r.forum })}\n\n`);
+            await new Promise(r => setTimeout(r, 10));
+          }
+        } catch (err) {
+          console.warn('Search stream instance error on', instance.id, err && (err as any).message || err);
+        }
+      }
+      res.write(`event: done\ndata: {}\n\n`);
+      res.end();
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // SSE extracted search stream
+  app.get('/api/search/extracted/stream', optionalAuth, async (req, res, next) => {
+    try {
+      const query = String(req.query.q || '');
+      if (!query) return res.status(400).send('Query required');
+      const forumId = req.query.forumId as string | undefined;
+      const userId = req.user?.id;
+
+      // Check access if forumId provided
+      if (forumId) {
+        const forum = await storage.getForumById(forumId);
+        if (!forum) return res.status(404).send('Forum not found');
+        if (!forum.isPublic) {
+          if (!req.isAuthenticated?.() || !req.user) return res.sendStatus(401);
+          const isMember = await storage.isForumMember(forumId, req.user.id);
+          if (!isMember) return res.status(403).send('Access denied');
+        }
+      }
+
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+
+      // Stream extracted DBs progressively by querying each Neon DB and streaming matching rows as they are found
+      const dbUrl = process.env.DATABASE_URL || '';
+      const dbUrls = dbUrl.split(',').map(u => u.trim()).filter(Boolean);
+      const hardcodedExtractedDb = 'postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
+      if (!dbUrls.includes(hardcodedExtractedDb)) dbUrls.push(hardcodedExtractedDb);
+
+      const searchTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+      const batchSize = 5; // small batch for progressive fetching and streaming
+      // Keep running count of extracted matches so clients can show totals while streaming
+      let extractedStreamedCount = 0;
+      for (let i = 0; i < dbUrls.length; i++) {
+        const dbU = dbUrls[i];
+        const dbIdentifier = dbU.split('@')[1]?.split('.')[0] || `db${i+1}`;
+        try {
+          const { Client } = await import('pg');
+          const client = new Client({ connectionString: dbU });
+          await client.connect();
+          const tableCheck = await client.query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings');`);
+          if (!tableCheck.rows[0].exists) { await client.end(); continue; }
+          // Stream rows in small batches to avoid loading everything into memory
+          let offset = 0;
+          let done = false;
+          while (!done) {
+            const { rows } = await client.query(`SELECT id, name, video, image, url, uploaddate, tags, uploadedby, size, type, last_updated FROM video_mappings ORDER BY last_updated DESC LIMIT ${batchSize} OFFSET ${offset}`);
+            if (!rows || rows.length === 0) { done = true; break; }
+
+          const adminUser = await storage.getUserByUsername('admin');
+          const forums = await storage.getForums();
+          let xmasterForum = forums.find((f: any) => f.name === 'Xmaster');
+          if (!xmasterForum && adminUser) {
+            try {
+              xmasterForum = await storage.createForum({ name: 'Xmaster', description: 'Extracted videos from external sources', isPublic: true, metaTitle: 'Xmaster' }, adminUser.id);
+            } catch (e) {
+              console.warn('Failed to create Xmaster forum', e);
+            }
+          }
+
+            for (const row of rows) {
+            const searchableText = [row.name || '', row.tags || '', row.uploadedby || '', row.video || '', row.url || ''].join(' ').toLowerCase();
+            if (searchTerms.every(term => searchableText.includes(term))) {
+              const file = {
+                id: `extracted_${i}_${row.id}`,
+                forumId: xmasterForum?.id || 'xmaster-forum-id',
+                userId: adminUser?.id || 'xmaster-user-id',
+                fileName: row.name || 'Unknown Video',
+                fileSize: parseInt(row.size) || 0,
+                mimeType: row.type || 'video/mp4',
+                thumbnail: row.image || null,
+                adminThumbnailUrl: row.image || null,
+                metaTitle: row.name || null,
+                uploadedAt: new Date(row.uploaddate || row.last_updated || Date.now()),
+                isAdminCreated: true,
+                adminCreatedBy: 'XMaster',
+                user: {
+                  id: adminUser?.id || 'xmaster-user-id',
+                  username: 'XMaster',
+                  email: adminUser?.email || 'xmaster@example.com',
+                  displayName: 'XMaster',
+                  avatar: adminUser?.avatar || null,
+                  createdAt: adminUser?.createdAt || new Date(),
+                  isAdmin: true,
+                  isActive: true,
+                },
+                forum: xmasterForum
+              };
+              res.write(`data: ${JSON.stringify({ type: 'file', data: file })}\n\n`);
+              extractedStreamedCount++;
+              await new Promise(r => setTimeout(r, 5));
+            }
+          }
+            // After processing the batch, emit updated count for extracted source
+            if (rows.length > 0) {
+              res.write(`event: count\ndata: ${JSON.stringify({ source: 'extracted', count: extractedStreamedCount })}\n\n`);
+            }
+            offset += batchSize;
+            if (rows.length < batchSize) done = true;
+          }
+          await client.end();
+        } catch (err) {
+          console.warn('Search extracted stream db error', dbIdentifier, err.message || err);
+        }
+      }
+      // Final extracted count (ensure client has final count)
+      res.write(`event: count\ndata: ${JSON.stringify({ source: 'extracted', count: extractedStreamedCount })}\n\n`);
+      res.write(`event: done\ndata: {}\n\n`);
+      res.end();
     } catch (error) {
       next(error);
     }

@@ -41,6 +41,9 @@ interface UnifiedTimelineProps {
   onLoadMore?: () => void;
   hasMore?: boolean;
   isLoadingMore?: boolean;
+  totalFiles?: number | null;
+  // Number of extracted neon db items (only included for Xmaster forum)
+  extractedCount?: number | null;
 }
 
 // Separate component for timeline items to properly handle hooks
@@ -95,13 +98,13 @@ function TimelineItem({
       <div key={`msg-${message.id}`} id={`message-${message.id}`} className="flex gap-3 group max-w-full">
         <Avatar className="h-10 w-10 flex-shrink-0">
           <AvatarFallback className="bg-primary text-primary-foreground">
-            {getInitials(message.user.username)}
+            {getInitials(message.user?.username || 'Unknown')}
           </AvatarFallback>
         </Avatar>
         <div className="flex-1 min-w-0 max-w-full overflow-hidden">
           <div className="flex items-baseline gap-2 mb-1">
             <span className="font-semibold text-sm">
-              {message.user.username}
+              {message.user?.username || 'Unknown'}
             </span>
             <span className="text-xs text-muted-foreground">
               {formatDistanceToNow(new Date(message.createdAt), { addSuffix: true })}
@@ -169,13 +172,13 @@ function TimelineItem({
       <div key={`file-${file.id}`} id={`file-${file.id}`} className="flex gap-3 max-w-full">
         <Avatar className="h-10 w-10 flex-shrink-0">
           <AvatarFallback className="bg-primary text-primary-foreground">
-            {getInitials(file.user.username)}
+            {getInitials(file.user?.username || file.adminCreatedBy || 'Unknown')}
           </AvatarFallback>
         </Avatar>
         <div className="flex-1 min-w-0 max-w-full overflow-hidden">
           <div className="flex items-baseline gap-2 mb-1">
             <span className="font-semibold text-sm">
-              {file.user.username}
+              {file.user?.username || file.adminCreatedBy || 'Unknown'}
             </span>
             <span className="text-xs text-muted-foreground">
               uploaded {formatDistanceToNow(new Date(file.uploadedAt), { addSuffix: true })}
@@ -192,7 +195,7 @@ function TimelineItem({
                     <ImageWithProxy
                       src={file.adminThumbnailUrl}
                       alt={file.fileName}
-                      className="w-20 h-22 object-cover rounded border border-zinc-700 cursor-pointer"
+                      className="w-28 h-28 object-cover rounded border border-zinc-700 cursor-pointer"
                       onClick={(e) => {
                         e.stopPropagation();
                         handlePreview(file);
@@ -202,7 +205,7 @@ function TimelineItem({
                     <ImageWithProxy
                       src={file.thumbnail}
                       alt={file.fileName}
-                      className="w-20 h-22 object-cover rounded border border-zinc-700 cursor-pointer"
+                      className="w-28 h-28 object-cover rounded border border-zinc-700 cursor-pointer"
                       onClick={(e) => {
                         e.stopPropagation();
                         handlePreview(file);
@@ -623,7 +626,10 @@ function FileTagsSection({
   );
 }
 
-export function UnifiedTimeline({ messages, files, forumId, scrollToMessage, scrollToFile, ws, uploadProgress, onLoadMore, hasMore, isLoadingMore }: UnifiedTimelineProps) {
+export function UnifiedTimeline({ messages, files, forumId, scrollToMessage, scrollToFile, ws, uploadProgress, onLoadMore, hasMore, isLoadingMore, totalFiles, extractedCount }: UnifiedTimelineProps) {
+  // totalFiles is passed in via props destructuring
+  // it may be undefined/null if not provided
+  
   const { toast } = useToast();
   const { user } = useAuth();
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -693,6 +699,12 @@ export function UnifiedTimeline({ messages, files, forumId, scrollToMessage, scr
           description: data.error || "An error occurred during download",
           variant: "destructive",
         });
+      } else if (data.type === 'file_deleted') {
+        console.log('[UnifiedTimeline] File deleted:', data.fileId);
+        queryClient.invalidateQueries({ predicate: (query) => {
+          const k = query.queryKey as any[];
+          return Array.isArray(k) && k[0] === '/api/forums' && k[1] === data.forumId && k[2] === 'files';
+        }});
       }
     };
 
@@ -1072,11 +1084,29 @@ export function UnifiedTimeline({ messages, files, forumId, scrollToMessage, scr
         <div ref={timelineEndRef} />
         {hasMore && onLoadMore && (
           <div className="flex justify-center py-4">
+            {typeof totalFiles === 'number' && (
+              <div className="w-full flex flex-col sm:flex-row items-center sm:justify-center gap-3 mb-3" aria-live="polite">
+                <div className="flex items-center gap-3 bg-gradient-to-r from-zinc-900 to-zinc-800 border border-zinc-800 px-3 py-2 rounded-full shadow-sm">
+                  <FileText className="h-4 w-4 text-muted-foreground" />
+                  <div className="text-[11px] text-muted-foreground leading-none uppercase tracking-wide">Total files</div>
+                  <div className="text-lg sm:text-xl font-semibold text-zinc-100">{totalFiles}</div>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-2 items-center">
+                  {typeof extractedCount === 'number' && extractedCount > 0 && (
+                    <div className="text-xs text-muted-foreground">
+                      Includes <span className="font-medium text-zinc-100">{extractedCount}</span> extracted
+                    </div>
+                  )}
+                  <div className="text-xs text-muted-foreground">Showing <span className="font-medium text-zinc-100">{files.length}</span> files</div>
+                </div>
+              </div>
+            )}
             <Button
               onClick={onLoadMore}
               disabled={isLoadingMore}
               variant="outline"
               size="sm"
+              className="min-w-[140px] rounded-full px-4"
             >
               {isLoadingMore ? (
                 <>

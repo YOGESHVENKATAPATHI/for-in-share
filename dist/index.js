@@ -1737,7 +1737,7 @@ import session from "express-session";
 import connectPg from "connect-pg-simple";
 import fs from "fs";
 import path from "path";
-import { eq as eq2, and, desc, sql as sql2, inArray, or, ilike, exists, isNotNull, ne } from "drizzle-orm";
+import { eq as eq2, and, desc, sql as sql2, inArray, or, ilike, exists, isNotNull } from "drizzle-orm";
 var PostgresSessionStore, DatabaseStorage, storage;
 var init_storage = __esm({
   "server/storage.ts"() {
@@ -2471,6 +2471,35 @@ var init_storage = __esm({
         );
         return filesWithChunks;
       }
+      async getFilesCount(forumId) {
+        const counts = await dbManager.executeOnAllInstances(async (database) => {
+          const [row] = await database.select({ count: sql2`count(*)::int` }).from(files).where(eq2(files.forumId, forumId));
+          return row ? [row.count || 0] : [0];
+        });
+        const normalCount = counts.reduce((acc, c) => acc + (Number(c) || 0), 0);
+        const forum = await this.getForumById(forumId);
+        const isXmasterForum = forum?.name === "Xmaster";
+        if (!isXmasterForum) {
+          return { total: normalCount };
+        }
+        try {
+          const { Client } = await import("pg");
+          const extractedDbClient = new Client({
+            connectionString: "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+          });
+          await extractedDbClient.connect();
+          const { rows: firstRows } = await extractedDbClient.query(`SELECT id FROM video_mappings ORDER BY id ASC LIMIT 1`);
+          const { rows: lastRows } = await extractedDbClient.query(`SELECT id FROM video_mappings ORDER BY id DESC LIMIT 1`);
+          await extractedDbClient.end();
+          const firstId = firstRows.length > 0 ? Number(firstRows[0].id) : 0;
+          const lastId = lastRows.length > 0 ? Number(lastRows[0].id) : 0;
+          const extractedCount = Math.max(firstId || 0, lastId || 0);
+          return { total: normalCount + extractedCount, extractedCount };
+        } catch (error) {
+          console.error("Error fetching extracted neon db counts for Xmaster:", error);
+          return { total: normalCount };
+        }
+      }
       async getFileById(id) {
         if (id.startsWith("extracted_")) {
           try {
@@ -2628,36 +2657,195 @@ var init_storage = __esm({
         }
       }
       async createFileChunk(fileId, chunkIndex, chunkSize, checksum, dropboxAccountId, dropboxPath, dropboxFileId, downloadUrl) {
-        const { instance } = await this.findFileShard(fileId);
-        const estimatedSize = 400 + dropboxPath.length * 2;
-        const [chunk] = await instance.db.insert(fileChunks).values({
-          fileId,
-          chunkIndex,
-          chunkSize,
-          checksum,
-          dropboxAccountId,
-          dropboxPath,
-          dropboxFileId,
-          downloadUrl
-        }).returning();
-        await dbManager.updateShardMetadata(instance.id, estimatedSize);
-        return chunk;
-      }
-      async deleteFile(id) {
-        const instances = dbManager.getAllInstances();
-        for (const instance of instances) {
+        try {
+          let targetInstance;
           try {
-            await instance.db.delete(fileChunks).where(eq2(fileChunks.fileId, id));
-            await instance.db.delete(files).where(eq2(files.id, id));
-          } catch (error) {
-            console.error(`Error deleting file from instance ${instance.id}:`, error);
+            const { instance } = await this.findFileShard(fileId);
+            targetInstance = instance;
+          } catch (e) {
+            console.warn(`createFileChunk: file ${fileId} not found in any shard, attempting to locate and copy to write shard`);
+            const instances = dbManager.getAllInstances();
+            let sourceFile = null;
+            for (const inst of instances) {
+              try {
+                const [f] = await inst.db.select().from(files).where(eq2(files.id, fileId)).limit(1);
+                if (f) {
+                  sourceFile = f;
+                  break;
+                }
+              } catch (err) {
+              }
+            }
+            targetInstance = dbManager.getInstanceForWrite();
+            if (sourceFile) {
+              try {
+                await this.ensureUserInShard(targetInstance, sourceFile.userId);
+              } catch (err) {
+                console.warn("Failed to ensure user in target shard while copying file:", err);
+              }
+              try {
+                await this.ensureForumInShard(targetInstance, sourceFile.forumId, sourceFile.userId);
+              } catch (err) {
+                console.warn("Failed to ensure forum in target shard while copying file:", err);
+              }
+              try {
+                await targetInstance.db.insert(files).values({
+                  id: sourceFile.id,
+                  forumId: sourceFile.forumId,
+                  userId: sourceFile.userId,
+                  fileName: sourceFile.fileName,
+                  fileSize: sourceFile.fileSize,
+                  mimeType: sourceFile.mimeType,
+                  thumbnail: sourceFile.thumbnail,
+                  adminThumbnailUrl: sourceFile.adminThumbnailUrl,
+                  metaTitle: sourceFile.metaTitle,
+                  metaDescription: sourceFile.metaDescription,
+                  keywords: sourceFile.keywords,
+                  uploadedAt: sourceFile.uploadedAt,
+                  isAdminCreated: sourceFile.isAdminCreated,
+                  adminCreatedBy: sourceFile.adminCreatedBy,
+                  directDownloadUrl: sourceFile.directDownloadUrl,
+                  adminNotes: sourceFile.adminNotes
+                }).onConflictDoNothing();
+                console.log(`createFileChunk: copied file ${fileId} into target shard ${targetInstance.id}`);
+              } catch (err) {
+                console.warn("Failed to copy file into target shard:", err);
+              }
+            } else {
+              console.warn(`createFileChunk: file ${fileId} not found in any shard and cannot be copied`);
+            }
           }
+          try {
+            const [chunk] = await targetInstance.db.insert(fileChunks).values({
+              fileId,
+              chunkIndex,
+              chunkSize,
+              checksum,
+              dropboxAccountId,
+              dropboxPath,
+              dropboxFileId,
+              downloadUrl
+            }).returning();
+            return chunk;
+          } catch (err) {
+            if (err?.code === "23503") {
+              console.warn("FK violation inserting chunk, attempting to copy file metadata and retrying");
+              const instances = dbManager.getAllInstances();
+              let sourceFile = null;
+              for (const inst of instances) {
+                try {
+                  const [f] = await inst.db.select().from(files).where(eq2(files.id, fileId)).limit(1);
+                  if (f) {
+                    sourceFile = f;
+                    break;
+                  }
+                } catch (e) {
+                }
+              }
+              if (sourceFile) {
+                try {
+                  await this.ensureUserInShard(targetInstance, sourceFile.userId);
+                  await this.ensureForumInShard(targetInstance, sourceFile.forumId, sourceFile.userId);
+                  await targetInstance.db.insert(files).values({
+                    id: sourceFile.id,
+                    forumId: sourceFile.forumId,
+                    userId: sourceFile.userId,
+                    fileName: sourceFile.fileName,
+                    fileSize: sourceFile.fileSize,
+                    mimeType: sourceFile.mimeType,
+                    thumbnail: sourceFile.thumbnail,
+                    adminThumbnailUrl: sourceFile.adminThumbnailUrl,
+                    metaTitle: sourceFile.metaTitle,
+                    metaDescription: sourceFile.metaDescription,
+                    keywords: sourceFile.keywords,
+                    uploadedAt: sourceFile.uploadedAt,
+                    isAdminCreated: sourceFile.isAdminCreated,
+                    adminCreatedBy: sourceFile.adminCreatedBy,
+                    directDownloadUrl: sourceFile.directDownloadUrl,
+                    adminNotes: sourceFile.adminNotes
+                  }).onConflictDoNothing();
+                  const [chunk] = await targetInstance.db.insert(fileChunks).values({
+                    fileId,
+                    chunkIndex,
+                    chunkSize,
+                    checksum,
+                    dropboxAccountId,
+                    dropboxPath,
+                    dropboxFileId,
+                    downloadUrl
+                  }).returning();
+                  return chunk;
+                } catch (retryErr) {
+                  console.error("Retry after copying file failed", retryErr);
+                  throw retryErr;
+                }
+              }
+            }
+            throw err;
+          }
+        } catch (err) {
+          console.error("Failed to create file chunk", err);
+          throw err;
         }
       }
+      async getTags(includeExtracted = false) {
+        console.log(`[Tags] getTags() called (includeExtracted=${includeExtracted})`);
+        const allResults = await dbManager.executeOnAllInstances(async (database) => {
+          return await database.select().from(tags).orderBy(tags.name);
+        });
+        const uniqueTags = /* @__PURE__ */ new Map();
+        allResults.forEach((tag) => {
+          if (!uniqueTags.has(tag.id)) {
+            uniqueTags.set(tag.id, tag);
+          }
+        });
+        console.log(`[Tags] Found ${uniqueTags.size} tags from normal databases`);
+        if (includeExtracted) {
+          try {
+            console.log(`[Tags] Loading tags from extracted database`);
+            const { Client } = await import("pg");
+            const extractedDbClient = new Client({
+              connectionString: process.env.EXTRACTED_DATABASE_URL || "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+            });
+            await extractedDbClient.connect();
+            const { rows } = await extractedDbClient.query(`
+          SELECT DISTINCT tags
+          FROM video_mappings
+          WHERE tags IS NOT NULL AND tags != ''
+        `);
+            await extractedDbClient.end();
+            console.log(`[Tags] Found ${rows.length} rows with tags in extracted database`);
+            const extractedTags = /* @__PURE__ */ new Set();
+            rows.forEach((row) => {
+              if (row.tags) {
+                row.tags.split(",").forEach((tag) => {
+                  const trimmedTag = tag.trim();
+                  if (trimmedTag) {
+                    extractedTags.add(trimmedTag);
+                  }
+                });
+              }
+            });
+            console.log(`[Tags] Extracted ${extractedTags.size} unique tags: [${Array.from(extractedTags).slice(0, 50).join(", ")}${extractedTags.size > 50 ? ", ..." : ""}]`);
+            extractedTags.forEach((t) => {
+              if (!Array.from(uniqueTags.values()).some((ut) => ut.name === t)) {
+                const id = `extracted_${t.toLowerCase().replace(/\s+/g, "_")}`;
+                uniqueTags.set(id, { id, name: t, description: null, color: null, createdAt: (/* @__PURE__ */ new Date()).toISOString() });
+              }
+            });
+            console.log(`[Tags] Added ${extractedTags.size} extracted tags to total ${uniqueTags.size} tags`);
+          } catch (err) {
+            console.warn("[Tags] Failed to load tags from extracted database", err);
+          }
+        } else {
+          console.log("[Tags] Skipping loading tags from extracted database (includeExtracted=false)");
+        }
+        return Array.from(uniqueTags.values());
+      }
       async createPartialUpload(forumId, userId, fileName, fileSize, mimeType, checksum, totalChunks) {
-        const instances = dbManager.getAllInstances();
-        const primaryInstance = instances[0];
         try {
+          const instances = dbManager.getAllInstances();
+          const primaryInstance = instances[0];
           const [partialUpload] = await primaryInstance.db.insert(partialUploads).values({
             forumId,
             userId,
@@ -2668,7 +2856,7 @@ var init_storage = __esm({
             totalChunks,
             uploadedChunks: []
           }).returning();
-          return partialUpload;
+          if (partialUpload) return partialUpload;
         } catch (error) {
           if (error?.code === "23503") {
             const { instance: userInstance } = await this.findUserShard(userId);
@@ -2934,64 +3122,57 @@ var init_storage = __esm({
         }
         console.log(`Cascade deletion completed for forum ${forumId}`);
       }
-      // Tag methods
-      async getTags() {
-        console.log(`[Tags] getTags() called`);
-        const allResults = await dbManager.executeOnAllInstances(async (database) => {
-          return await database.select().from(tags).orderBy(tags.name);
-        });
-        const uniqueTags = /* @__PURE__ */ new Map();
-        allResults.forEach((tag) => {
-          if (!uniqueTags.has(tag.id)) {
-            uniqueTags.set(tag.id, tag);
-          }
-        });
-        console.log(`[Tags] Found ${uniqueTags.size} tags from normal databases`);
+      async deleteFile(id) {
         try {
-          console.log(`[Tags] Loading tags from extracted database`);
-          const { Client } = await import("pg");
-          const extractedDbClient = new Client({
-            connectionString: "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-          });
-          await extractedDbClient.connect();
-          const { rows } = await extractedDbClient.query(`
-        SELECT DISTINCT tags
-        FROM video_mappings
-        WHERE tags IS NOT NULL AND tags != ''
-      `);
-          await extractedDbClient.end();
-          console.log(`[Tags] Found ${rows.length} rows with tags in extracted database`);
-          const extractedTags = /* @__PURE__ */ new Set();
-          rows.forEach((row) => {
-            if (row.tags) {
-              row.tags.split(",").forEach((tag) => {
-                const trimmedTag = tag.trim();
-                if (trimmedTag) {
-                  extractedTags.add(trimmedTag);
-                }
-              });
+          const file = await this.getFileById(id);
+          if (!file) {
+            console.warn(`deleteFile: file ${id} not found`);
+            return;
+          }
+          for (const chunk of file.chunks) {
+            try {
+              if (chunk.dropboxPath) {
+                await dropboxManager.deleteChunk(chunk.dropboxAccountId, chunk.dropboxPath);
+                dropboxManager.updateAccountUsage(chunk.dropboxAccountId, -chunk.chunkSize);
+              }
+            } catch (error) {
+              console.error(`Error deleting chunk ${chunk.id} from Dropbox:`, error);
             }
-          });
-          console.log(`[Tags] Extracted ${extractedTags.size} unique tags:`, Array.from(extractedTags));
-          extractedTags.forEach((tagName) => {
-            const tagId = `extracted_${tagName.toLowerCase().replace(/\s+/g, "_")}`;
-            if (!uniqueTags.has(tagId)) {
-              uniqueTags.set(tagId, {
-                id: tagId,
-                name: tagName,
-                description: "Tag from extracted videos",
-                color: "#6b7280",
-                // Default gray color
-                createdAt: /* @__PURE__ */ new Date()
-              });
+          }
+          const instances = dbManager.getAllInstances();
+          for (const instance of instances) {
+            try {
+              await instance.db.delete(fileChunks).where(eq2(fileChunks.fileId, id));
+            } catch (error) {
+              console.error(`Error deleting file chunks from instance ${instance.id}:`, error);
             }
-          });
-          console.log(`[Tags] Added ${extractedTags.size} extracted tags to total ${uniqueTags.size} tags`);
+            try {
+              await instance.db.delete(fileTags).where(eq2(fileTags.fileId, id));
+            } catch (error) {
+              console.error(`Error deleting file tags from instance ${instance.id}:`, error);
+            }
+            try {
+              await instance.db.delete(files).where(eq2(files.id, id));
+            } catch (error) {
+              console.error(`Error deleting file from instance ${instance.id}:`, error);
+            }
+          }
+          try {
+            const hlsDir = path.join(process.cwd(), "storage", "hls", id);
+            if (fs.existsSync(hlsDir)) {
+              fs.rmSync(hlsDir, { recursive: true, force: true });
+              console.log(`[Storage] Deleted HLS directory: ${hlsDir}`);
+            }
+          } catch (error) {
+            console.error("Error deleting HLS directory for file", id, error);
+          }
+          console.log(`deleteFile: completed deletion for file ${id}`);
         } catch (error) {
-          console.error("Error fetching tags from extracted database:", error);
+          console.error("deleteFile: unexpected error", error);
+          throw error;
         }
-        return Array.from(uniqueTags.values()).sort((a, b) => a.name.localeCompare(b.name));
       }
+      // Tag methods
       async createTag(tagData) {
         const instances = dbManager.getAllInstances();
         const primaryInstance = instances[0];
@@ -3059,52 +3240,6 @@ var init_storage = __esm({
           }).from(table).innerJoin(tags, eq2(table.tagId, tags.id)).where(eq2(entityColumn, entityId)).orderBy(tags.name);
         });
         return allResults;
-      }
-      async getFilesByTags(tagIds, excludeFileId) {
-        const allResults = await dbManager.executeOnAllInstances(async (database) => {
-          let query = database.select({
-            id: files.id,
-            forumId: files.forumId,
-            userId: files.userId,
-            fileName: files.fileName,
-            fileSize: files.fileSize,
-            mimeType: files.mimeType,
-            thumbnail: files.thumbnail,
-            adminThumbnailUrl: files.adminThumbnailUrl,
-            metaTitle: files.metaTitle,
-            metaDescription: files.metaDescription,
-            keywords: files.keywords,
-            uploadedAt: files.uploadedAt,
-            isAdminCreated: files.isAdminCreated,
-            adminCreatedBy: files.adminCreatedBy,
-            directDownloadUrl: files.directDownloadUrl,
-            adminNotes: files.adminNotes,
-            chunks: database.select({
-              id: fileChunks.id,
-              fileId: fileChunks.fileId,
-              chunkIndex: fileChunks.chunkIndex,
-              chunkSize: fileChunks.chunkSize,
-              checksum: fileChunks.checksum,
-              dropboxAccountId: fileChunks.dropboxAccountId,
-              dropboxPath: fileChunks.dropboxPath,
-              dropboxFileId: fileChunks.dropboxFileId,
-              downloadUrl: fileChunks.downloadUrl,
-              uploadedAt: fileChunks.uploadedAt
-            }).from(fileChunks).where(eq2(fileChunks.fileId, files.id)).orderBy(fileChunks.chunkIndex)
-          }).from(fileTags).innerJoin(files, eq2(fileTags.fileId, files.id)).where(inArray(fileTags.tagId, tagIds));
-          if (excludeFileId) {
-            query = query.where(ne(files.id, excludeFileId));
-          }
-          return await query.orderBy(files.uploadedAt).limit(10);
-        });
-        const flattened = allResults.flat();
-        const seen = /* @__PURE__ */ new Set();
-        const uniqueFiles = flattened.filter((file) => {
-          if (seen.has(file.id)) return false;
-          seen.add(file.id);
-          return true;
-        });
-        return uniqueFiles;
       }
       async assignTagsToEntity(entityType, entityId, tagIds) {
         if (entityType === "file" || entityType === "message") {
@@ -3415,163 +3550,169 @@ var init_storage = __esm({
           throw e;
         }
       }
-      async searchEntities(query, userId) {
+      async searchEntities(query, userId, forumId) {
         const lowercaseQuery = `%${query.toLowerCase()}%`;
+        const targetForum = forumId ? await this.getForumById(forumId) : void 0;
+        const includeExtracted = !forumId || targetForum?.name === "Xmaster";
         let extractedFiles = [];
-        try {
-          console.log(`[Search] Searching extracted databases for query: "${query}"`);
-          const dbUrl = process.env.DATABASE_URL || "";
-          const dbUrls = dbUrl.split(",").map((url) => url.trim()).filter(Boolean);
-          console.log(`[Search] Found ${dbUrls.length} database URLs to search:`, dbUrls.map((url) => url.split("@")[1]?.split(".")[0] || "unknown"));
-          const hardcodedExtractedDb = "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
-          if (!dbUrls.includes(hardcodedExtractedDb)) {
-            dbUrls.push(hardcodedExtractedDb);
-            console.log(`[Search] Added hardcoded extracted database to search list`);
-          }
-          const dbResults = [];
-          for (let i = 0; i < dbUrls.length; i++) {
-            const dbUrl2 = dbUrls[i];
-            const dbIdentifier = dbUrl2.split("@")[1]?.split(".")[0] || `db${i + 1}`;
-            console.log(`[Search] Querying database ${i + 1}/${dbUrls.length}: ${dbIdentifier}`);
-            try {
-              const { Client } = await import("pg");
-              const client = new Client({ connectionString: dbUrl2 });
-              await client.connect();
-              const tableCheck = await client.query(`
+        if (includeExtracted) {
+          try {
+            console.log(`[Search] Searching extracted databases for query: "${query}"`);
+            const dbUrl = process.env.DATABASE_URL || "";
+            const dbUrls = dbUrl.split(",").map((url) => url.trim()).filter(Boolean);
+            console.log(`[Search] Found ${dbUrls.length} database URLs to search:`, dbUrls.map((url) => url.split("@")[1]?.split(".")[0] || "unknown"));
+            const hardcodedExtractedDb = "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
+            if (!dbUrls.includes(hardcodedExtractedDb)) {
+              dbUrls.push(hardcodedExtractedDb);
+              console.log(`[Search] Added hardcoded extracted database to search list`);
+            }
+            const dbResults = [];
+            for (let i = 0; i < dbUrls.length; i++) {
+              const dbUrl2 = dbUrls[i];
+              const dbIdentifier = dbUrl2.split("@")[1]?.split(".")[0] || `db${i + 1}`;
+              console.log(`[Search] Querying database ${i + 1}/${dbUrls.length}: ${dbIdentifier}`);
+              try {
+                const { Client } = await import("pg");
+                const client = new Client({ connectionString: dbUrl2 });
+                await client.connect();
+                const tableCheck = await client.query(`
             SELECT EXISTS (
               SELECT 1 FROM information_schema.tables 
               WHERE table_name = 'video_mappings'
             );
           `);
-              if (!tableCheck.rows[0].exists) {
-                console.log(`[Search] Database ${dbIdentifier} does not have video_mappings table, skipping`);
-                await client.end();
-                dbResults.push({ db: dbIdentifier, hasTable: false, totalFiles: 0, matchingFiles: 0 });
-                continue;
-              }
-              console.log(`[Search] Database ${dbIdentifier} has video_mappings table, fetching data...`);
-              const { rows } = await client.query(`
+                if (!tableCheck.rows[0].exists) {
+                  console.log(`[Search] Database ${dbIdentifier} does not have video_mappings table, skipping`);
+                  await client.end();
+                  dbResults.push({ db: dbIdentifier, hasTable: false, totalFiles: 0, matchingFiles: 0 });
+                  continue;
+                }
+                console.log(`[Search] Database ${dbIdentifier} has video_mappings table, fetching data...`);
+                const { rows } = await client.query(`
             SELECT id, name, video, image, url, uploaddate, tags, uploadedby, size, type, last_updated
             FROM video_mappings
             ORDER BY last_updated DESC
           `);
-              await client.end();
-              console.log(`[Search] Database ${dbIdentifier} returned ${rows.length} total files`);
-              let matchingFiles = 0;
-              if (rows.length > 0) {
-                const searchTerms = query.toLowerCase().split(/\s+/).filter((term) => term.length > 0);
-                console.log(`[Search] Database ${dbIdentifier} searching for terms:`, searchTerms);
-                let matchCount = 0;
-                const filteredRows = rows.filter((row) => {
-                  const searchableText = [
-                    row.name || "",
-                    row.tags || "",
-                    row.uploadedby || "",
-                    row.video || "",
-                    row.url || ""
-                  ].join(" ").toLowerCase();
-                  const matches = searchTerms.every((term) => searchableText.includes(term));
-                  if (matches) {
-                    matchCount++;
-                    if (matchCount <= 3) {
-                      console.log(`[Search] MATCH: "${row.name}" with tags "${row.tags}" contains all terms ${searchTerms.join(", ")}`);
+                await client.end();
+                console.log(`[Search] Database ${dbIdentifier} returned ${rows.length} total files`);
+                let matchingFiles = 0;
+                if (rows.length > 0) {
+                  const searchTerms = query.toLowerCase().split(/\s+/).filter((term) => term.length > 0);
+                  console.log(`[Search] Database ${dbIdentifier} searching for terms:`, searchTerms);
+                  let matchCount = 0;
+                  const filteredRows = rows.filter((row) => {
+                    const searchableText = [
+                      row.name || "",
+                      row.tags || "",
+                      row.uploadedby || "",
+                      row.video || "",
+                      row.url || ""
+                    ].join(" ").toLowerCase();
+                    const matches = searchTerms.every((term) => searchableText.includes(term));
+                    if (matches) {
+                      matchCount++;
+                      if (matchCount <= 3) {
+                        console.log(`[Search] MATCH: "${row.name}" with tags "${row.tags}" contains all terms ${searchTerms.join(", ")}`);
+                      }
+                    } else if (matchCount === 0 && row.name && row.name.toLowerCase().includes("hot") && matchCount < 2) {
+                      console.log(`[Search] NO MATCH: "${row.name}" with tags "${row.tags}" missing terms ${searchTerms.join(", ")}`);
                     }
-                  } else if (matchCount === 0 && row.name && row.name.toLowerCase().includes("hot") && matchCount < 2) {
-                    console.log(`[Search] NO MATCH: "${row.name}" with tags "${row.tags}" missing terms ${searchTerms.join(", ")}`);
-                  }
-                  return matches;
-                });
-                matchingFiles = filteredRows.length;
-                console.log(`[Search] Database ${dbIdentifier} filtered to ${matchingFiles} matching files for query "${query}"`);
-                if (filteredRows.length > 0) {
-                  console.log(`[Search] Sample matches from ${dbIdentifier}:`);
-                  filteredRows.slice(0, 3).forEach((row) => {
-                    console.log(`  - ID: ${row.id}, Name: "${row.name}", Tags: "${row.tags}"`);
+                    return matches;
                   });
-                }
-                if (filteredRows.length > 0) {
-                  const adminUser = await this.getUserByUsername("admin");
-                  const forums2 = await this.getForums();
-                  let xmasterForum = forums2.find((f) => f.name === "Xmaster");
-                  if (!xmasterForum && adminUser) {
-                    console.log(`[Search] Creating Xmaster forum since it doesn't exist`);
-                    try {
-                      xmasterForum = await this.createForum({
+                  matchingFiles = filteredRows.length;
+                  console.log(`[Search] Database ${dbIdentifier} filtered to ${matchingFiles} matching files for query "${query}"`);
+                  if (filteredRows.length > 0) {
+                    console.log(`[Search] Sample matches from ${dbIdentifier}:`);
+                    filteredRows.slice(0, 3).forEach((row) => {
+                      console.log(`  - ID: ${row.id}, Name: "${row.name}", Tags: "${row.tags}"`);
+                    });
+                  }
+                  if (filteredRows.length > 0) {
+                    const adminUser = await this.getUserByUsername("admin");
+                    const forums2 = await this.getForums();
+                    let xmasterForum = forums2.find((f) => f.name === "Xmaster");
+                    if (!xmasterForum && adminUser) {
+                      console.log(`[Search] Creating Xmaster forum since it doesn't exist`);
+                      try {
+                        xmasterForum = await this.createForum({
+                          name: "Xmaster",
+                          description: "Extracted videos from external sources",
+                          isPublic: true,
+                          metaTitle: "Xmaster",
+                          metaDescription: "Extracted videos",
+                          keywords: "videos,extracted"
+                        }, adminUser.id);
+                        console.log(`[Search] Created Xmaster forum with ID: ${xmasterForum.id}`);
+                      } catch (error) {
+                        console.error(`[Search] Failed to create Xmaster forum:`, error);
+                      }
+                    }
+                    console.log(`[Search] Xmaster forum lookup: found=${!!xmasterForum}, id=${xmasterForum?.id || "none"}, adminUser=${adminUser?.username || "none"}`);
+                    if (!xmasterForum) {
+                      console.log(`[Search] WARNING: Xmaster forum not found and could not be created, using fallback ID`);
+                    }
+                    const dbFiles = filteredRows.slice(0, 50).map((row) => ({
+                      id: `extracted_${i}_${row.id}`,
+                      // Prefix with db index to avoid conflicts
+                      forumId: xmasterForum?.id || "xmaster-forum-id",
+                      userId: adminUser?.id || "admin-user-id",
+                      fileName: row.name || "Unknown Video",
+                      fileSize: parseInt(row.size) || 0,
+                      mimeType: row.type || "video/mp4",
+                      thumbnail: row.image || null,
+                      adminThumbnailUrl: row.image || null,
+                      metaTitle: row.name || null,
+                      metaDescription: null,
+                      keywords: row.tags || null,
+                      uploadedAt: new Date(row.uploaddate || row.last_updated || Date.now()),
+                      isAdminCreated: true,
+                      adminCreatedBy: "XMaster",
+                      directDownloadUrl: row.url || null,
+                      adminNotes: `From DB ${dbIdentifier}`,
+                      user: {
+                        id: adminUser?.id || "xmaster-user-id",
+                        username: "XMaster",
+                        email: adminUser?.email || "xmaster@example.com",
+                        displayName: "XMaster",
+                        avatar: adminUser?.avatar || null,
+                        createdAt: adminUser?.createdAt || /* @__PURE__ */ new Date(),
+                        isAdmin: true,
+                        isActive: true
+                      },
+                      forum: xmasterForum || {
+                        id: "xmaster-forum-id",
                         name: "Xmaster",
                         description: "Extracted videos from external sources",
                         isPublic: true,
+                        creatorId: adminUser?.id || "admin-user-id",
                         metaTitle: "Xmaster",
                         metaDescription: "Extracted videos",
-                        keywords: "videos,extracted"
-                      }, adminUser.id);
-                      console.log(`[Search] Created Xmaster forum with ID: ${xmasterForum.id}`);
-                    } catch (error) {
-                      console.error(`[Search] Failed to create Xmaster forum:`, error);
-                    }
+                        keywords: "videos,extracted",
+                        ogImage: null,
+                        createdAt: /* @__PURE__ */ new Date()
+                      },
+                      chunks: [],
+                      commentCount: 0,
+                      tags: row.tags ? row.tags.split(",").map((tag) => tag.trim()).filter(Boolean) : [],
+                      videoUrl: row.video || row.url
+                    }));
+                    extractedFiles.push(...dbFiles);
+                    console.log(`[Search] Added ${dbFiles.length} files from database ${dbIdentifier} to results`);
                   }
-                  console.log(`[Search] Xmaster forum lookup: found=${!!xmasterForum}, id=${xmasterForum?.id || "none"}, adminUser=${adminUser?.username || "none"}`);
-                  if (!xmasterForum) {
-                    console.log(`[Search] WARNING: Xmaster forum not found and could not be created, using fallback ID`);
-                  }
-                  const dbFiles = filteredRows.slice(0, 50).map((row) => ({
-                    id: `extracted_${i}_${row.id}`,
-                    // Prefix with db index to avoid conflicts
-                    forumId: xmasterForum?.id || "xmaster-forum-id",
-                    userId: adminUser?.id || "admin-user-id",
-                    fileName: row.name || "Unknown Video",
-                    fileSize: parseInt(row.size) || 0,
-                    mimeType: row.type || "video/mp4",
-                    thumbnail: row.image || null,
-                    adminThumbnailUrl: row.image || null,
-                    metaTitle: row.name || null,
-                    metaDescription: null,
-                    keywords: row.tags || null,
-                    uploadedAt: new Date(row.uploaddate || row.last_updated || Date.now()),
-                    isAdminCreated: true,
-                    adminCreatedBy: row.uploadedby || null,
-                    directDownloadUrl: row.url || null,
-                    adminNotes: `From DB ${dbIdentifier}`,
-                    user: adminUser || {
-                      id: "admin-user-id",
-                      username: "XMaster",
-                      email: "Xmaster@gmail.com",
-                      displayName: "XMaster",
-                      avatar: null,
-                      createdAt: /* @__PURE__ */ new Date(),
-                      isAdmin: true,
-                      isActive: true
-                    },
-                    forum: xmasterForum || {
-                      id: "xmaster-forum-id",
-                      name: "Xmaster",
-                      description: "Extracted videos from external sources",
-                      isPublic: true,
-                      creatorId: adminUser?.id || "admin-user-id",
-                      metaTitle: "Xmaster",
-                      metaDescription: "Extracted videos",
-                      keywords: "videos,extracted",
-                      ogImage: null,
-                      createdAt: /* @__PURE__ */ new Date()
-                    },
-                    chunks: [],
-                    commentCount: 0,
-                    tags: row.tags ? row.tags.split(",").map((tag) => tag.trim()).filter(Boolean) : [],
-                    videoUrl: row.video || row.url
-                  }));
-                  extractedFiles.push(...dbFiles);
-                  console.log(`[Search] Added ${dbFiles.length} files from database ${dbIdentifier} to results`);
                 }
+                dbResults.push({ db: dbIdentifier, hasTable: true, totalFiles: rows.length, matchingFiles });
+              } catch (dbError) {
+                console.error(`[Search] Error querying database ${dbIdentifier}:`, dbError);
+                dbResults.push({ db: dbIdentifier, hasTable: false, totalFiles: 0, matchingFiles: 0, error: dbError.message });
               }
-              dbResults.push({ db: dbIdentifier, hasTable: true, totalFiles: rows.length, matchingFiles });
-            } catch (dbError) {
-              console.error(`[Search] Error querying database ${dbIdentifier}:`, dbError);
-              dbResults.push({ db: dbIdentifier, hasTable: false, totalFiles: 0, matchingFiles: 0, error: dbError.message });
             }
+            console.log(`[Search] Database search summary:`, dbResults);
+            console.log(`[Search] Total extracted files from all databases: ${extractedFiles.length}`);
+          } catch (error) {
+            console.error("[Search] Error searching extracted databases:", error);
           }
-          console.log(`[Search] Database search summary:`, dbResults);
-          console.log(`[Search] Total extracted files from all databases: ${extractedFiles.length}`);
-        } catch (error) {
-          console.error("[Search] Error searching extracted databases:", error);
+        } else {
+          console.log(`[Search] Skipping extracted DB search for forumId=${forumId}`);
         }
         console.log(`[Search] Starting search across local databases for query "${query}"`);
         const results = await dbManager.executeOnAllInstances(async (database) => {
@@ -3598,14 +3739,18 @@ var init_storage = __esm({
               )
             )
           )).limit(20);
-          const fileResults = await database.select({
+          let fileQuery = database.select({
             file: files,
             user: users,
             forum: forums
           }).from(files).innerJoin(users, eq2(files.userId, users.id)).innerJoin(forums, eq2(files.forumId, forums.id)).leftJoin(forumMembers, and(
             eq2(forumMembers.forumId, forums.id),
             userId ? eq2(forumMembers.userId, userId) : sql2`1=0`
-          )).where(and(
+          ));
+          if (forumId) {
+            fileQuery = fileQuery.where(eq2(files.forumId, forumId));
+          }
+          fileQuery = fileQuery.where(and(
             or(
               eq2(forums.isPublic, true),
               userId ? eq2(forums.creatorId, userId) : sql2`1=0`,
@@ -3624,15 +3769,20 @@ var init_storage = __esm({
                 ))
               )
             )
-          )).limit(20);
-          const messageResults = await database.select({
+          )).limit(50);
+          const fileResults = await fileQuery;
+          let messageQuery = database.select({
             message: messages,
             user: users,
             forum: forums
           }).from(messages).innerJoin(users, eq2(messages.userId, users.id)).innerJoin(forums, eq2(messages.forumId, forums.id)).leftJoin(forumMembers, and(
             eq2(forumMembers.forumId, forums.id),
             userId ? eq2(forumMembers.userId, userId) : sql2`1=0`
-          )).where(and(
+          ));
+          if (forumId) {
+            messageQuery = messageQuery.where(eq2(messages.forumId, forumId));
+          }
+          messageQuery = messageQuery.where(and(
             or(
               eq2(forums.isPublic, true),
               userId ? eq2(forums.creatorId, userId) : sql2`1=0`,
@@ -3647,7 +3797,8 @@ var init_storage = __esm({
                 ))
               )
             )
-          )).limit(20);
+          )).limit(50);
+          const messageResults = await messageQuery;
           return { forums: forumResults.map((r) => r.forum), files: fileResults, messages: messageResults };
         });
         console.log(`[Search] Merging results from ${results.length} database instances`);
@@ -3658,8 +3809,7 @@ var init_storage = __esm({
         console.log(`[Search] - Forums: ${mergedForums.length}`);
         console.log(`[Search] - Files: ${mergedFiles.length}`);
         console.log(`[Search] - Messages: ${mergedMessages.length}`);
-        console.log(`[Search] Adding ${extractedFiles.length} extracted files to results`);
-        mergedFiles.push(...extractedFiles);
+        console.log(`[Search] Skipping adding extracted files to merged results; if needed use the /api/search/extracted endpoint`);
         console.log(`[Search] Final results for query "${query}":`);
         console.log(`[Search] - Forums: ${mergedForums.length}`);
         console.log(`[Search] - Files: ${mergedFiles.length} (including ${extractedFiles.length} extracted)`);
@@ -3669,6 +3819,94 @@ var init_storage = __esm({
           files: mergedFiles,
           messages: mergedMessages
         };
+      }
+      async searchExtractedFiles(query, forumId) {
+        const resultsFiles = [];
+        const searchTerms = query.toLowerCase().split(/\s+/).filter((t) => t.length > 0);
+        try {
+          const dbUrl = process.env.DATABASE_URL || "";
+          const dbUrls = dbUrl.split(",").map((u) => u.trim()).filter(Boolean);
+          const hardcodedExtractedDb = "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
+          if (!dbUrls.includes(hardcodedExtractedDb)) dbUrls.push(hardcodedExtractedDb);
+          for (let i = 0; i < dbUrls.length; i++) {
+            const url = dbUrls[i];
+            const dbIdentifier = url.split("@")[1]?.split(".")[0] || `db${i + 1}`;
+            try {
+              const { Client } = await import("pg");
+              const client = new Client({ connectionString: url });
+              await client.connect();
+              const tableCheck = await client.query(`
+            SELECT EXISTS (
+              SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings'
+            );
+          `);
+              if (!tableCheck.rows[0].exists) {
+                await client.end();
+                continue;
+              }
+              const { rows } = await client.query(`
+            SELECT id, name, video, image, url, uploaddate, tags, uploadedby, size, type, last_updated
+            FROM video_mappings
+            ORDER BY last_updated DESC
+          `);
+              await client.end();
+              const filtered = rows.filter((row) => {
+                const searchableText = [row.name || "", row.tags || "", row.uploadedby || "", row.video || "", row.url || ""].join(" ").toLowerCase();
+                return searchTerms.every((term) => searchableText.includes(term));
+              });
+              if (filtered.length === 0) continue;
+              const adminUser = await this.getUserByUsername("admin");
+              const forums2 = await this.getForums();
+              let xmasterForum = forums2.find((f) => f.name === "Xmaster");
+              if (!xmasterForum && adminUser) {
+                try {
+                  xmasterForum = await this.createForum({ name: "Xmaster", description: "Extracted videos from external sources", isPublic: true, metaTitle: "Xmaster" }, adminUser.id);
+                } catch (e) {
+                  console.warn(`[Search:Extracted] Failed to create Xmaster forum:`, e.message || e);
+                }
+              }
+              const dbFiles = filtered.slice(0, 50).map((row) => ({
+                id: `extracted_${i}_${row.id}`,
+                forumId: xmasterForum?.id || "xmaster-forum-id",
+                userId: adminUser?.id || "admin-user-id",
+                fileName: row.name || "Unknown Video",
+                fileSize: parseInt(row.size) || 0,
+                mimeType: row.type || "video/mp4",
+                thumbnail: row.image || null,
+                adminThumbnailUrl: row.image || null,
+                metaTitle: row.name || null,
+                metaDescription: null,
+                keywords: row.tags || null,
+                uploadedAt: new Date(row.uploaddate || row.last_updated || Date.now()),
+                isAdminCreated: true,
+                adminCreatedBy: row.uploadedby || null,
+                directDownloadUrl: row.url || null,
+                adminNotes: `From DB ${dbIdentifier}`,
+                user: {
+                  id: adminUser?.id || "xmaster-user-id",
+                  username: "XMaster",
+                  email: adminUser?.email || "xmaster@example.com",
+                  displayName: "XMaster",
+                  avatar: adminUser?.avatar || null,
+                  createdAt: adminUser?.createdAt || /* @__PURE__ */ new Date(),
+                  isAdmin: true,
+                  isActive: true
+                },
+                forum: xmasterForum || { id: "xmaster-forum-id", name: "Xmaster", description: "Extracted videos from external sources", isPublic: true, creatorId: adminUser?.id || "admin-user-id", metaTitle: "Xmaster", metaDescription: "Extracted videos", keywords: "videos,extracted", ogImage: null, createdAt: /* @__PURE__ */ new Date() },
+                chunks: [],
+                commentCount: 0,
+                tags: row.tags ? row.tags.split(",").map((t) => t.trim()).filter(Boolean) : [],
+                videoUrl: row.video || row.url
+              }));
+              resultsFiles.push(...dbFiles);
+            } catch (error) {
+              console.warn(`[Search:Extracted] error querying DB ${dbIdentifier}:`, error.message || error);
+            }
+          }
+        } catch (err) {
+          console.error("[Search:Extracted] failed:", err.message || err);
+        }
+        return resultsFiles;
       }
       async resetAllUserData(userId) {
         console.log(`[Storage] Starting comprehensive data reset for user: ${userId}`);
@@ -5857,6 +6095,9 @@ function pingAllDatabases() {
 }
 setInterval(pingAllDatabases, 3e4);
 
+// server/routes.ts
+import { eq as eq3, and as and2, or as or2, ilike as ilike2, exists as exists2, isNotNull as isNotNull2, sql as sql3 } from "drizzle-orm";
+
 // server/distributed-chunk-manager.ts
 import axios2 from "axios";
 import crypto2 from "crypto";
@@ -7298,31 +7539,6 @@ async function registerRoutes(app2) {
       });
     }
   });
-  app2.post("/api/upload-servers/register", async (req, res) => {
-    try {
-      const { serverId, url, region, capabilities } = req.body;
-      if (!serverId || !url) {
-        return res.status(400).json({
-          error: "Server ID and URL are required"
-        });
-      }
-      const success = distributedChunkManager.addServer(url, {
-        maxJobs: capabilities?.maxConcurrentUploads || 5,
-        region: region || "unknown"
-      });
-      console.log(`\u{1F4E1} Upload server registration: ${serverId} at ${url} - ${success ? "Success" : "Failed"}`);
-      res.json({
-        success,
-        serverId,
-        message: success ? "Server registered successfully" : "Server registration failed"
-      });
-    } catch (error) {
-      res.status(500).json({
-        error: "Failed to register upload server",
-        message: error.message
-      });
-    }
-  });
   app2.get("/api/upload-servers/list", (req, res) => {
     try {
       const stats = distributedChunkManager.getStats();
@@ -7595,6 +7811,21 @@ async function registerRoutes(app2) {
       const offset = parseInt(req.query.offset) || 0;
       const files2 = await storage.getFiles(req.params.id, limit, offset);
       res.json(files2);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.get("/api/forums/:id/files/count", optionalAuth, async (req, res, next) => {
+    try {
+      const forum = await storage.getForumById(req.params.id);
+      if (!forum) return res.status(404).send("Forum not found");
+      if (!forum.isPublic) {
+        if (!req.isAuthenticated?.() || !req.user) return res.sendStatus(401);
+        const isMember = await storage.isForumMember(forum.id, req.user.id);
+        if (!isMember) return res.status(403).send("Access denied");
+      }
+      const counts = await storage.getFilesCount(req.params.id);
+      res.json(counts);
     } catch (error) {
       next(error);
     }
@@ -8020,53 +8251,24 @@ async function registerRoutes(app2) {
       res.status(500).json({ error: error.message });
     }
   });
-  app2.get("/api/files/:id", optionalAuth, async (req, res) => {
+  app2.get("/api/files/:id", optionalAuth, async (req, res, next) => {
     try {
-      const file = await storage.getFileById(req.params.id);
-      if (!file) {
-        return res.status(404).json({ error: "File not found" });
-      }
-      const isExtractedFile = req.params.id.startsWith("extracted_");
-      const forum = await storage.getForumById(file.forumId);
-      if (!forum && !isExtractedFile) {
-        return res.status(404).json({ error: "Forum not found" });
-      }
-      if (!forum?.isPublic && !isExtractedFile) {
-        if (!req.isAuthenticated?.() || !req.user) {
-          return res.status(401).json({ error: "Authentication required" });
+      const id = req.params.id;
+      const file = await storage.getFileById(id);
+      if (!file) return res.status(404).json({ error: "File not found" });
+      try {
+        const forum = await storage.getForumById(file.forumId);
+        if (forum && !forum.isPublic) {
+          if (!req.isAuthenticated?.() || !req.user) return res.sendStatus(401);
+          const isMember = await storage.isForumMember(forum.id, req.user.id);
+          const isCreator = forum.creatorId === req.user.id;
+          if (!isMember && !isCreator) return res.status(403).json({ error: "Access denied" });
         }
-        const isMember = await storage.isForumMember(forum.id, req.user.id);
-        if (!isMember) {
-          return res.status(403).json({ error: "Access denied" });
-        }
-      } else if (isExtractedFile) {
-        if (!req.isAuthenticated?.() || !req.user) {
-          return res.status(401).json({ error: "Authentication required" });
-        }
+      } catch (e) {
       }
       res.json(file);
     } catch (error) {
-      console.error("File request error:", error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-  app2.get("/api/files/:id/related", optionalAuth, async (req, res) => {
-    try {
-      const file = await storage.getFileById(req.params.id);
-      if (!file) {
-        return res.status(404).json({ error: "File not found" });
-      }
-      const fileTags2 = await storage.getEntityTags("file", req.params.id);
-      const tagIds = fileTags2.map((tag) => tag.id);
-      if (tagIds.length === 0) {
-        return res.json([]);
-      }
-      const relatedFiles = await storage.getFilesByTags(tagIds, req.params.id);
-      const limitedRelatedFiles = relatedFiles.slice(0, 5);
-      res.json(limitedRelatedFiles);
-    } catch (error) {
-      console.error("Related files request error:", error);
-      res.status(500).json({ error: error.message });
+      next(error);
     }
   });
   const chunkInfoCache = /* @__PURE__ */ new Map();
@@ -8114,37 +8316,6 @@ async function registerRoutes(app2) {
       });
     } catch (error) {
       console.error("Cancel priority processing error:", error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-  app2.get("/api/files/:id/priority-status", requireAuth, async (req, res, next) => {
-    try {
-      const fileId = req.params.id;
-      const file = await storage.getFileById(fileId);
-      if (!file) {
-        return res.status(404).json({ error: "File not found" });
-      }
-      if (!file.isPublic) {
-        const user = req.user;
-        if (!user) {
-          return res.status(401).json({ error: "Authentication required" });
-        }
-        const hasAccess = await storage.isForumMember(file.forumId, user.id);
-        if (!hasAccess) {
-          return res.status(403).json({ error: "Access denied" });
-        }
-      }
-      const processorStatus = globalPriorityProcessor.getStatus();
-      const streamingStatus = globalStreamingProcessor.getStatus?.() || { activeChunks: [], priorityChunks: [] };
-      res.json({
-        fileId,
-        fileName: file.fileName,
-        priorityProcessor: processorStatus,
-        streamingProcessor: streamingStatus,
-        timestamp: Date.now()
-      });
-    } catch (error) {
-      console.error("Priority status error:", error);
       res.status(500).json({ error: error.message });
     }
   });
@@ -8198,84 +8369,6 @@ async function registerRoutes(app2) {
     } catch (error) {
       console.error("Chunk info error:", error);
       next(error);
-    }
-  });
-  app2.post("/api/files/:id/priority-chunk", requireAuth, async (req, res, next) => {
-    try {
-      const { chunkIndex, forceProcess = true } = req.body;
-      const fileId = req.params.id;
-      if (chunkIndex === void 0 || chunkIndex < 0) {
-        return res.status(400).json({ error: "Valid chunk index required" });
-      }
-      const file = await storage.getFileById(fileId);
-      if (!file) {
-        return res.status(404).json({ error: "File not found" });
-      }
-      if (!file.isPublic) {
-        const user = req.user;
-        if (!user) {
-          return res.status(401).json({ error: "Authentication required" });
-        }
-        const hasAccess = await storage.isForumMember(file.forumId, user.id);
-        if (!hasAccess) {
-          return res.status(403).json({ error: "Access denied" });
-        }
-      }
-      const chunks = file.chunks?.sort((a, b) => a.chunkIndex - b.chunkIndex) || [];
-      const targetChunk = chunks.find((c) => c.chunkIndex === chunkIndex);
-      if (!targetChunk) {
-        return res.status(404).json({ error: "Chunk not found" });
-      }
-      console.log(`[PriorityChunk] Processing priority request for chunk ${chunkIndex} of file ${file.fileName}`);
-      globalStreamingProcessor.setPriorityChunks([chunkIndex]);
-      try {
-        const result = await globalPriorityProcessor.processChunkImmediate(
-          `${fileId}-${chunkIndex}`,
-          chunkIndex,
-          async (signal) => {
-            await new Promise((resolve) => {
-              if (signal.aborted) {
-                throw new Error("Aborted");
-              }
-              setTimeout(() => {
-                if (signal.aborted) {
-                  throw new Error("Aborted");
-                }
-                resolve(null);
-              }, 100);
-            });
-            return {
-              chunkId: `${fileId}-${chunkIndex}`,
-              chunkIndex,
-              processed: true,
-              timestamp: Date.now()
-            };
-          },
-          {
-            priority: "high",
-            cancelOthers: forceProcess,
-            timeout: 15e3
-            // 15 second timeout for chunk processing
-          }
-        );
-        console.log(`[PriorityChunk] Successfully processed priority chunk ${chunkIndex} for file ${file.fileName}`);
-        res.json({
-          success: true,
-          message: `Chunk ${chunkIndex} processed with high priority`,
-          result,
-          streamUrl: `/api/files/${fileId}/stream?chunk=${chunkIndex}&priority=true`
-        });
-      } catch (error) {
-        console.error(`[PriorityChunk] Failed to process priority chunk ${chunkIndex}:`, error);
-        res.status(500).json({
-          success: false,
-          error: "Failed to process priority chunk",
-          message: error.message
-        });
-      }
-    } catch (error) {
-      console.error("Priority chunk processing error:", error);
-      res.status(500).json({ error: error.message });
     }
   });
   app2.post("/api/files/:id/priority-chunk", requireAuth, async (req, res, next) => {
@@ -9469,6 +9562,15 @@ Referer: ${defaultHeaders["Referer"]}\r
         }
       }
       await storage.deleteFile(file.id);
+      clients.forEach((c) => {
+        if (c.ws.readyState === WebSocket2.OPEN) {
+          c.ws.send(JSON.stringify({
+            type: "file_deleted",
+            forumId: file.forumId,
+            fileId: file.id
+          }));
+        }
+      });
       res.sendStatus(200);
     } catch (error) {
       next(error);
@@ -9510,6 +9612,15 @@ Referer: ${defaultHeaders["Referer"]}\r
       const file = files2.find((f) => f.fileName === partialUpload.fileName && f.fileSize === partialUpload.fileSize);
       if (file) {
         await storage.deleteFile(file.id);
+        clients.forEach((c) => {
+          if (c.ws.readyState === WebSocket2.OPEN) {
+            c.ws.send(JSON.stringify({
+              type: "file_deleted",
+              forumId: partialUpload.forumId,
+              fileId: file.id
+            }));
+          }
+        });
       }
       await storage.deletePartialUpload(partialUpload.id);
       res.sendStatus(200);
@@ -9958,7 +10069,8 @@ Referer: ${defaultHeaders["Referer"]}\r
   });
   app2.get("/api/tags", optionalAuth, async (req, res, next) => {
     try {
-      const tags2 = await storage.getTags();
+      const includeExtracted = String(req.query.includeExtracted || "false") === "true";
+      const tags2 = await storage.getTags(includeExtracted);
       res.json(tags2);
     } catch (error) {
       next(error);
@@ -10232,13 +10344,292 @@ Referer: ${defaultHeaders["Referer"]}\r
       console.log(`[API] Search request: query="${query}", user=${req.user?.username || "anonymous"}`);
       console.log(`[API] Starting comprehensive search across extracted databases and local databases...`);
       const startTime = Date.now();
-      const results = await storage.searchEntities(query, req.user?.id);
+      const forumId = req.query.forumId;
+      const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit || "20"), 10)));
+      const offset = Math.max(0, parseInt(String(req.query.offset || "0"), 10));
+      const localResults = await storage.searchEntities(query, req.user?.id, forumId);
+      const extractedFiles = await storage.searchExtractedFiles(query, forumId);
+      const allFilesMap = {};
+      for (const f of [...localResults.files, ...extractedFiles]) {
+        allFilesMap[f.id] = f;
+      }
+      const mergedFiles = Object.values(allFilesMap).sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+      const totalFiles = mergedFiles.length;
+      const paginatedFiles = mergedFiles.slice(offset, offset + limit);
       const duration = Date.now() - startTime;
-      console.log(`[API] Search completed: query="${query}", results=forums:${results.forums.length} files:${results.files.length} messages:${results.messages.length}, duration=${duration}ms`);
-      const extractedFiles = results.files.filter((f) => f.id.startsWith("extracted_"));
-      const localFiles = results.files.filter((f) => !f.id.startsWith("extracted_"));
-      console.log(`[API] Result breakdown: extracted_files:${extractedFiles.length}, local_files:${localFiles.length}, forums:${results.forums.length}, messages:${results.messages.length}`);
-      res.json(results);
+      console.log(`[API] Search completed: query="${query}", totalFiles:${totalFiles}, returned:${paginatedFiles.length}, duration=${duration}ms`);
+      res.json({ forums: localResults.forums, messages: localResults.messages, files: paginatedFiles, totalFiles });
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.get("/api/search/extracted", optionalAuth, async (req, res, next) => {
+    try {
+      const query = req.query.q;
+      if (!query) return res.status(400).send("Query is required");
+      const forumId = req.query.forumId;
+      const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit || "20"), 10)));
+      const offset = Math.max(0, parseInt(String(req.query.offset || "0"), 10));
+      const results = await storage.searchExtractedFiles(query, forumId);
+      const totalFiles = results.length;
+      const files2 = results.sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()).slice(offset, offset + limit);
+      res.json({ files: files2, totalFiles });
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.get("/api/search/stream", optionalAuth, async (req, res, next) => {
+    try {
+      const query = String(req.query.q || "");
+      if (!query) return res.status(400).send("Query required");
+      const forumId = req.query.forumId;
+      const userId = req.user?.id;
+      if (forumId) {
+        const forum = await storage.getForumById(forumId);
+        if (!forum) return res.status(404).send("Forum not found");
+        if (!forum.isPublic) {
+          if (!req.isAuthenticated?.() || !req.user) return res.sendStatus(401);
+          const isMember = await storage.isForumMember(forumId, req.user.id);
+          if (!isMember) return res.status(403).send("Access denied");
+        }
+      }
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders?.();
+      const instances = dbManager.getAllInstances();
+      const shardBatchSize = 5;
+      const lower = `%${query.toLowerCase()}%`;
+      let localStreamedCount = 0;
+      for (const instance of instances) {
+        let offset = 0;
+        let more = true;
+        while (more) {
+          try {
+            const fileQueryBatch = instance.db.select({ file: files, user: users, forum: forums }).from(files).innerJoin(users, eq3(files.userId, users.id)).innerJoin(forums, eq3(files.forumId, forums.id)).leftJoin(forumMembers, and2(eq3(forumMembers.forumId, forums.id), userId ? eq3(forumMembers.userId, userId) : sql3`1=0`)).where(and2(
+              or2(eq3(forums.isPublic, true), userId ? eq3(forums.creatorId, userId) : sql3`1=0`, userId ? isNotNull2(forumMembers.id) : sql3`1=0`),
+              or2(
+                ilike2(files.fileName, lower),
+                and2(isNotNull2(files.metaTitle), ilike2(files.metaTitle, lower)),
+                and2(isNotNull2(files.metaDescription), ilike2(files.metaDescription, lower)),
+                and2(isNotNull2(files.keywords), ilike2(files.keywords, lower)),
+                and2(isNotNull2(files.adminNotes), ilike2(files.adminNotes, lower)),
+                exists2(instance.db.select().from(fileTags).innerJoin(tags, eq3(fileTags.tagId, tags.id)).where(and2(eq3(fileTags.fileId, files.id), ilike2(tags.name, lower))))
+              )
+            )).limit(shardBatchSize).offset(offset);
+            const rows = await fileQueryBatch;
+            for (const r of rows) {
+              const payload = { type: "file", data: { ...r.file, user: r.user, forum: r.forum } };
+              res.write(`data: ${JSON.stringify(payload)}
+
+`);
+              localStreamedCount++;
+              await new Promise((r2) => setTimeout(r2, 10));
+            }
+            if (rows.length > 0) {
+              res.write(`event: count
+data: ${JSON.stringify({ source: "local", count: localStreamedCount })}
+
+`);
+            }
+            if (rows.length < shardBatchSize) more = false;
+            else offset += shardBatchSize;
+          } catch (err) {
+            console.warn("Search stream shard batch error on", instance.id, err && err.message || err);
+            more = false;
+          }
+        }
+        try {
+          const fileQuery = instance.db.select({ file: files, user: users, forum: forums }).from(files).innerJoin(users, eq3(files.userId, users.id)).innerJoin(forums, eq3(files.forumId, forums.id)).leftJoin(forumMembers, and2(eq3(forumMembers.forumId, forums.id), userId ? eq3(forumMembers.userId, userId) : sql3`1=0`));
+          const lower2 = `%${query.toLowerCase()}%`;
+          let conditionedFileQuery = fileQuery.where(and2(
+            or2(eq3(forums.isPublic, true), userId ? eq3(forums.creatorId, userId) : sql3`1=0`, userId ? isNotNull2(forumMembers.id) : sql3`1=0`),
+            or2(
+              ilike2(files.fileName, lower2),
+              and2(isNotNull2(files.metaTitle), ilike2(files.metaTitle, lower2)),
+              and2(isNotNull2(files.metaDescription), ilike2(files.metaDescription, lower2)),
+              and2(isNotNull2(files.keywords), ilike2(files.keywords, lower2)),
+              and2(isNotNull2(files.adminNotes), ilike2(files.adminNotes, lower2)),
+              exists2(instance.db.select().from(fileTags).innerJoin(tags, eq3(fileTags.tagId, tags.id)).where(and2(eq3(fileTags.fileId, files.id), ilike2(tags.name, lower2))))
+            )
+          ));
+          if (forumId) conditionedFileQuery = conditionedFileQuery.where(eq3(files.forumId, forumId));
+          const fileRows = await conditionedFileQuery;
+          for (const r of fileRows) {
+            const payload = { type: "file", data: { ...r.file, user: r.user, forum: r.forum } };
+            res.write(`data: ${JSON.stringify(payload)}
+
+`);
+            localStreamedCount++;
+            await new Promise((r2) => setTimeout(r2, 10));
+          }
+          if (fileRows.length > 0) {
+            res.write(`event: count
+data: ${JSON.stringify({ source: "local", count: localStreamedCount })}
+
+`);
+          }
+          const messageQuery = instance.db.select({ message: messages, user: users, forum: forums }).from(messages).innerJoin(users, eq3(messages.userId, users.id)).innerJoin(forums, eq3(messages.forumId, forums.id)).leftJoin(forumMembers, and2(eq3(forumMembers.forumId, forums.id), userId ? eq3(forumMembers.userId, userId) : sql3`1=0`));
+          let conditionedMessageQuery = messageQuery.where(and2(
+            or2(eq3(forums.isPublic, true), userId ? eq3(forums.creatorId, userId) : sql3`1=0`, userId ? isNotNull2(forumMembers.id) : sql3`1=0`),
+            or2(
+              ilike2(messages.content, lower2),
+              exists2(instance.db.select().from(messageTags).innerJoin(tags, eq3(messageTags.tagId, tags.id)).where(and2(eq3(messageTags.messageId, messages.id), ilike2(tags.name, lower2))))
+            )
+          ));
+          if (forumId) conditionedMessageQuery = conditionedMessageQuery.where(eq3(messages.forumId, forumId));
+          let msgOffset = 0;
+          let msgMore = true;
+          while (msgMore) {
+            const msgBatch = await conditionedMessageQuery.limit(shardBatchSize).offset(msgOffset);
+            for (const r of msgBatch) {
+              const payload = { type: "message", data: { ...r.message, user: r.user, forum: r.forum } };
+              res.write(`data: ${JSON.stringify(payload)}
+
+`);
+              await new Promise((r2) => setTimeout(r2, 10));
+            }
+            if (msgBatch.length < shardBatchSize) msgMore = false;
+            else msgOffset += shardBatchSize;
+          }
+          const forumQuery = instance.db.select({ forum: forums }).from(forums).leftJoin(forumMembers, and2(eq3(forumMembers.forumId, forums.id), userId ? eq3(forumMembers.userId, userId) : sql3`1=0`)).where(and2(
+            or2(eq3(forums.isPublic, true), userId ? eq3(forums.creatorId, userId) : sql3`1=0`, userId ? isNotNull2(forumMembers.id) : sql3`1=0`),
+            or2(ilike2(forums.name, lower2), ilike2(forums.description, lower2), exists2(instance.db.select().from(forumTags).innerJoin(tags, eq3(forumTags.tagId, tags.id)).where(and2(eq3(forumTags.forumId, forums.id), ilike2(tags.name, lower2)))))
+          ));
+          const forumRows = await forumQuery.limit(20);
+          for (const r of forumRows) {
+            res.write(`data: ${JSON.stringify({ type: "forum", data: r.forum })}
+
+`);
+            await new Promise((r2) => setTimeout(r2, 10));
+          }
+        } catch (err) {
+          console.warn("Search stream instance error on", instance.id, err && err.message || err);
+        }
+      }
+      res.write(`event: done
+data: {}
+
+`);
+      res.end();
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.get("/api/search/extracted/stream", optionalAuth, async (req, res, next) => {
+    try {
+      const query = String(req.query.q || "");
+      if (!query) return res.status(400).send("Query required");
+      const forumId = req.query.forumId;
+      const userId = req.user?.id;
+      if (forumId) {
+        const forum = await storage.getForumById(forumId);
+        if (!forum) return res.status(404).send("Forum not found");
+        if (!forum.isPublic) {
+          if (!req.isAuthenticated?.() || !req.user) return res.sendStatus(401);
+          const isMember = await storage.isForumMember(forumId, req.user.id);
+          if (!isMember) return res.status(403).send("Access denied");
+        }
+      }
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders?.();
+      const dbUrl = process.env.DATABASE_URL || "";
+      const dbUrls = dbUrl.split(",").map((u) => u.trim()).filter(Boolean);
+      const hardcodedExtractedDb = "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
+      if (!dbUrls.includes(hardcodedExtractedDb)) dbUrls.push(hardcodedExtractedDb);
+      const searchTerms = query.toLowerCase().split(/\s+/).filter((t) => t.length > 0);
+      const batchSize = 5;
+      let extractedStreamedCount = 0;
+      for (let i = 0; i < dbUrls.length; i++) {
+        const dbU = dbUrls[i];
+        const dbIdentifier = dbU.split("@")[1]?.split(".")[0] || `db${i + 1}`;
+        try {
+          const { Client } = await import("pg");
+          const client = new Client({ connectionString: dbU });
+          await client.connect();
+          const tableCheck = await client.query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings');`);
+          if (!tableCheck.rows[0].exists) {
+            await client.end();
+            continue;
+          }
+          let offset = 0;
+          let done = false;
+          while (!done) {
+            const { rows } = await client.query(`SELECT id, name, video, image, url, uploaddate, tags, uploadedby, size, type, last_updated FROM video_mappings ORDER BY last_updated DESC LIMIT ${batchSize} OFFSET ${offset}`);
+            if (!rows || rows.length === 0) {
+              done = true;
+              break;
+            }
+            const adminUser = await storage.getUserByUsername("admin");
+            const forums2 = await storage.getForums();
+            let xmasterForum = forums2.find((f) => f.name === "Xmaster");
+            if (!xmasterForum && adminUser) {
+              try {
+                xmasterForum = await storage.createForum({ name: "Xmaster", description: "Extracted videos from external sources", isPublic: true, metaTitle: "Xmaster" }, adminUser.id);
+              } catch (e) {
+                console.warn("Failed to create Xmaster forum", e);
+              }
+            }
+            for (const row of rows) {
+              const searchableText = [row.name || "", row.tags || "", row.uploadedby || "", row.video || "", row.url || ""].join(" ").toLowerCase();
+              if (searchTerms.every((term) => searchableText.includes(term))) {
+                const file = {
+                  id: `extracted_${i}_${row.id}`,
+                  forumId: xmasterForum?.id || "xmaster-forum-id",
+                  userId: adminUser?.id || "xmaster-user-id",
+                  fileName: row.name || "Unknown Video",
+                  fileSize: parseInt(row.size) || 0,
+                  mimeType: row.type || "video/mp4",
+                  thumbnail: row.image || null,
+                  adminThumbnailUrl: row.image || null,
+                  metaTitle: row.name || null,
+                  uploadedAt: new Date(row.uploaddate || row.last_updated || Date.now()),
+                  isAdminCreated: true,
+                  adminCreatedBy: "XMaster",
+                  user: {
+                    id: adminUser?.id || "xmaster-user-id",
+                    username: "XMaster",
+                    email: adminUser?.email || "xmaster@example.com",
+                    displayName: "XMaster",
+                    avatar: adminUser?.avatar || null,
+                    createdAt: adminUser?.createdAt || /* @__PURE__ */ new Date(),
+                    isAdmin: true,
+                    isActive: true
+                  },
+                  forum: xmasterForum
+                };
+                res.write(`data: ${JSON.stringify({ type: "file", data: file })}
+
+`);
+                extractedStreamedCount++;
+                await new Promise((r) => setTimeout(r, 5));
+              }
+            }
+            if (rows.length > 0) {
+              res.write(`event: count
+data: ${JSON.stringify({ source: "extracted", count: extractedStreamedCount })}
+
+`);
+            }
+            offset += batchSize;
+            if (rows.length < batchSize) done = true;
+          }
+          await client.end();
+        } catch (err) {
+          console.warn("Search extracted stream db error", dbIdentifier, err.message || err);
+        }
+      }
+      res.write(`event: count
+data: ${JSON.stringify({ source: "extracted", count: extractedStreamedCount })}
+
+`);
+      res.write(`event: done
+data: {}
+
+`);
+      res.end();
     } catch (error) {
       next(error);
     }

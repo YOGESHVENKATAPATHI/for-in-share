@@ -44,7 +44,7 @@ function TagList({ tags }: { tags?: TagItem[] }) {
   const remaining = Math.max(0, safeTags.length - limit);
 
   return (
-    <div className="flex flex-wrap gap-1">
+    <div className="flex flex-wrap gap-1 items-center min-h-6">
       {displayTags.map((tag) => (
         <Badge
           key={tag.id}
@@ -156,6 +156,21 @@ export default function ForumPage() {
     onSuccess: (data) => {
       console.log('[ForumPage] Search results loaded:', data);
       (data.files || []).forEach((f: any) => fetchAndMergeFile(f));
+      // Merge search results into forum files view for immediate availability
+      try {
+        setAllFiles(prev => {
+          const map: Record<string, any> = {};
+          prev.forEach((f: any) => { map[f.id] = f; });
+          (data.files || []).forEach((f: any) => {
+            if (f.forumId === forumId || String(f.id).startsWith('extracted_')) {
+              if (!map[f.id]) map[f.id] = f;
+            }
+          });
+          return Object.values(map).sort((a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+        });
+      } catch (err) {
+        console.warn('Failed merging search results into allFiles', err);
+      }
     },
     onError: (error) => console.log('[ForumPage] Search error:', error),
   });
@@ -189,6 +204,23 @@ export default function ForumPage() {
       });
       // Start prefetching details for incoming files if necessary
       (data.files || []).forEach((f: any) => fetchAndMergeFile(f));
+      // Also merge returned search files into the forum's file list (so they appear on the page)
+      try {
+        setAllFiles(prev => {
+          const map: Record<string, any> = {};
+          prev.forEach((f: any) => { map[f.id] = f; });
+          (data.files || []).forEach((f: any) => {
+            // Only add files that belong to this forum (or extracted)
+            if (f.forumId === forumId || String(f.id).startsWith('extracted_')) {
+              if (!map[f.id]) map[f.id] = f;
+            }
+          });
+          // Sort by uploadedAt desc
+          return Object.values(map).sort((a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+        });
+      } catch (err) {
+        console.warn('Failed to merge search results into allFiles', err);
+      }
       setSearchLocalTotalFiles(data.totalFiles || 0);
       setSearchOffset(offset + (data.files || []).length);
     } catch (err) {
@@ -250,6 +282,17 @@ export default function ForumPage() {
       }
       // Prefetch details for each extracted file (no-op for extracted but keeps UI consistent)
       (data.files || []).forEach((f: any) => fetchAndMergeFile(f));
+      // Merge into forum file list so extracted results are visible in the forum view
+      try {
+        setAllFiles(prev => {
+          const map: Record<string, any> = {};
+          prev.forEach((f: any) => { map[f.id] = f; });
+          (data.files || []).forEach((f: any) => { if (!map[f.id]) map[f.id] = f; });
+          return Object.values(map).sort((a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+        });
+      } catch (err) {
+        console.warn('Failed merging extracted results into allFiles', err);
+      }
       setSearchExtractedTotalFiles(data.totalFiles || 0);
     },
     onError: (error) => console.log('[ForumPage] Extracted search error:', error),
@@ -857,7 +900,7 @@ export default function ForumPage() {
     }
 
     return (
-      <div className="flex items-center gap-2 mt-2">
+      <div className="flex items-center gap-2 mt-2 min-h-6">
         {selectedTags.length > 0 && <TagList tags={selectedTags} />}
         {isCreator && (
           <Button
@@ -956,11 +999,7 @@ export default function ForumPage() {
                   )}
                 </Badge>
               )}
-              {debouncedSearchQuery.trim() && searchFiles.length > 0 && (
-                <div className="ml-2 text-xs text-muted-foreground hidden sm:flex items-center">
-                  Showing <span className="font-medium text-zinc-100 mx-1">{searchFiles.length}</span> of <span className="font-medium text-zinc-100 mx-1">{searchTotalFiles}</span>
-                </div>
-              )}
+              
               {/* Load more button for paginated search results */}
               {debouncedSearchQuery.trim() && searchFiles.length > 0 && searchFiles.length < searchTotalFiles && (
                 <>
@@ -975,17 +1014,7 @@ export default function ForumPage() {
                       {isLoadingSearchPage ? 'Loading...' : `Load more (${Math.min(searchLimit, searchTotalFiles - searchFiles.length)})`}
                     </Button>
                   </div>
-                  <div className="mt-2 sm:hidden w-full">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={loadMoreSearchResults}
-                      disabled={isLoadingSearchPage}
-                      className="w-full rounded-full px-3 py-2 text-sm"
-                    >
-                      {isLoadingSearchPage ? 'Loading...' : `Load more (${Math.min(searchLimit, searchTotalFiles - searchFiles.length)})`}
-                    </Button>
-                  </div>
+                  {/* Mobile load-more is rendered inline inside the results area to avoid header layout jumps */}
                 </>
               )}
               <Button
@@ -1051,6 +1080,20 @@ export default function ForumPage() {
               </div>
             ) : (
               <div className="flex-1 overflow-y-auto pb-24">
+                {/* Mobile-only in-content Load more for search to keep header stable */}
+                {debouncedSearchQuery.trim() && searchFiles.length > 0 && searchFiles.length < searchTotalFiles && (
+                  <div className="sm:hidden px-4 pb-3">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={loadMoreSearchResults}
+                      disabled={isLoadingSearchPage}
+                      className="w-full rounded-full px-3 py-2 text-sm"
+                    >
+                      {isLoadingSearchPage ? 'Loading...' : `Load more (${Math.min(searchLimit, searchTotalFiles - searchFiles.length)})`}
+                    </Button>
+                  </div>
+                )}
                 <UnifiedTimeline
                   messages={searchFilteredMessages}
                   files={searchFilteredFiles}
@@ -1089,6 +1132,21 @@ export default function ForumPage() {
                 Upload File
               </Button>
             </div>
+
+              {/* Mobile-only Load more for search inside Files view to avoid header instability */}
+              {debouncedSearchQuery.trim() && searchFiles.length > 0 && searchFiles.length < searchTotalFiles && (
+                <div className="sm:hidden mb-4 px-0">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={loadMoreSearchResults}
+                    disabled={isLoadingSearchPage}
+                    className="w-full rounded-full px-3 py-2 text-sm"
+                  >
+                    {isLoadingSearchPage ? 'Loading...' : `Load more (${Math.min(searchLimit, searchTotalFiles - searchFiles.length)})`}
+                  </Button>
+                </div>
+              )}
 
             {showFileUpload && (
               <div className="mb-6">

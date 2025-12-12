@@ -419,8 +419,9 @@ function MessageTagsSection({
         </div>
       ) : (
         <>
-          {selectedTags.length > 0 && <TagList tags={selectedTags} />}
-          <Button
+          <div className="flex items-center gap-2 mt-2 min-h-6">
+            {selectedTags.length > 0 && <TagList tags={selectedTags} />}
+            <Button
             variant="ghost"
             size="sm"
             className="h-6 px-2 text-xs"
@@ -429,6 +430,7 @@ function MessageTagsSection({
             <TagIcon className="h-3 w-3 mr-1" />
             {selectedTags.length > 0 ? 'Edit' : 'Tag'}
           </Button>
+          </div>
         </>
       )}
     </div>
@@ -609,7 +611,7 @@ function FileTagsSection({
           </div>
         </div>
       ) : (
-        <>
+        <div className="flex items-center gap-2 mt-2 min-h-6">
           {selectedTags.length > 0 && <TagList tags={selectedTags} />}
           <Button
             variant="ghost"
@@ -620,7 +622,7 @@ function FileTagsSection({
             <TagIcon className="h-3 w-3 mr-1" />
             {selectedTags.length > 0 ? 'Edit' : 'Tag'}
           </Button>
-        </>
+        </div>
       )}
     </div>
   );

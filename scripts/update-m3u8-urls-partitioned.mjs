@@ -13,6 +13,7 @@ const TOTAL_PARTS = parseInt(process.env.TOTAL_PARTS || '3', 10); // e.g., 3
 const UPDATE_INTERVAL_MS = 60000;
 const PORT = process.env.PORT || 3000;
 const KEEP_ALIVE_INTERVAL_MS = parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || '30000', 10);
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '10', 10);
 const MAIN_SERVER_URLS = (process.env.MAIN_SERVER_URLS || 'http://localhost:3000').split(',').map(url => url.trim()); // Main server URLs for keep-alive pings, comma-separated
 let updaterStarted = false;
 let updaterError = null;
@@ -91,23 +92,26 @@ async function updateM3u8UrlsPartitioned() {
         await sleep(UPDATE_INTERVAL_MS);
         continue;
       }
-      // Get all records in this partition needing update, ordered by last_updated (NULLS FIRST)
+      // Get up to BATCH_SIZE records in this partition needing update, ordered by last_updated (NULLS FIRST)
       let { rows } = await client.query(
-        `SELECT * FROM video_mappings WHERE id = ANY($1) AND (last_updated IS NULL OR last_updated < NOW() - INTERVAL '2 hours') ORDER BY last_updated NULLS FIRST`,
-        [ids]
+        `SELECT * FROM video_mappings WHERE id = ANY($1) AND (last_updated IS NULL OR last_updated < NOW() - INTERVAL '2 hours') ORDER BY last_updated NULLS FIRST LIMIT $2`,
+        [ids, BATCH_SIZE]
       );
-      // If no records in this partition, take over from other partitions
-      if (rows.length === 0) {
-        logStatus('No mappings in partition need update. Taking over other partitions...');
-        const { rows: allUpdateRows } = await client.query(
-          `SELECT * FROM video_mappings WHERE (last_updated IS NULL OR last_updated < NOW() - INTERVAL '2 hours') ORDER BY last_updated NULLS FIRST LIMIT 10`
+      // If there are fewer than BATCH_SIZE records in this partition, top-up from other partitions
+      if (rows.length < BATCH_SIZE) {
+        const remaining = BATCH_SIZE - rows.length;
+        logStatus(`Partition returned ${rows.length}/${BATCH_SIZE} rows. Topping up ${remaining} rows from other partitions...`);
+        const { rows: extraRows } = await client.query(
+          `SELECT * FROM video_mappings WHERE (last_updated IS NULL OR last_updated < NOW() - INTERVAL '2 hours') AND NOT (id = ANY($1)) ORDER BY last_updated NULLS FIRST LIMIT $2`,
+          [ids, remaining]
         );
-        rows = allUpdateRows;
-        if (rows.length === 0) {
-          logStatus('No mappings in any partition need update. Sleeping...');
-          await sleep(UPDATE_INTERVAL_MS);
-          continue;
-        }
+        if (extraRows && extraRows.length > 0) rows = rows.concat(extraRows);
+      }
+      // If still none, try to take over other partitions entirely (no partition restriction)
+      if (rows.length === 0) {
+        logStatus('No mappings in any partition need update. Sleeping...');
+        await sleep(UPDATE_INTERVAL_MS);
+        continue;
       }
       logStatus('Records filtered for update (null/oldest):');
       rows.forEach(r => {

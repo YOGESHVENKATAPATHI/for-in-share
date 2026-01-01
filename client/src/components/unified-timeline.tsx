@@ -172,13 +172,13 @@ function TimelineItem({
       <div key={`file-${file.id}`} id={`file-${file.id}`} className="flex gap-3 max-w-full">
         <Avatar className="h-10 w-10 flex-shrink-0">
           <AvatarFallback className="bg-primary text-primary-foreground">
-            {getInitials(file.user?.username || file.adminCreatedBy || 'Unknown')}
+            {getInitials(file.user?.displayName || file.user?.username || file.adminCreatedBy || 'Unknown')}
           </AvatarFallback>
         </Avatar>
         <div className="flex-1 min-w-0 max-w-full overflow-hidden">
           <div className="flex items-baseline gap-2 mb-1">
             <span className="font-semibold text-sm">
-              {file.user?.username || file.adminCreatedBy || 'Unknown'}
+              {file.user?.displayName || file.user?.username || file.adminCreatedBy || 'Unknown'}
             </span>
             <span className="text-xs text-muted-foreground">
               uploaded {formatDistanceToNow(new Date(file.uploadedAt), { addSuffix: true })}
@@ -278,7 +278,7 @@ function TimelineItem({
                       <span className="hidden md:inline">Preview</span>
                     </Button>
                   )}
-                  {!(file.mimeType?.startsWith("application/x-mpegurl") || file.fileName.toLowerCase().endsWith('.m3u8')) && (
+                  {!(file.mimeType?.startsWith("application/x-mpegurl") || file.fileName.toLowerCase().endsWith('.m3u8')) && !file.id?.startsWith('extracted_') && (
                     <Button
                       variant="outline"
                       size="sm"
@@ -684,6 +684,16 @@ export function UnifiedTimeline({ messages, files, forumId, scrollToMessage, scr
           });
           return newUploading;
         });
+
+        // Refresh file list for the affected forum so uploader info is available
+        try {
+          queryClient.invalidateQueries({ predicate: (query) => {
+            const k = query.queryKey as any[];
+            return Array.isArray(k) && k[0] === '/api/forums' && k[1] === data.forumId && k[2] === 'files';
+          }});
+        } catch (e) {
+          console.warn('[UnifiedTimeline] Failed to invalidate files query after file_uploaded', e);
+        }
       } else if (data.type === 'download_complete') {
         console.log(`[UnifiedTimeline] Download completed for file ${data.fileId}`);
         setDownloadingFiles((prev) => {
@@ -1021,20 +1031,57 @@ export function UnifiedTimeline({ messages, files, forumId, scrollToMessage, scr
   // Auto-scroll to specific message or file when URL parameters are present
   useEffect(() => {
     if (scrollToMessage || scrollToFile) {
-      // Small delay to ensure DOM is fully rendered
-      const timer = setTimeout(() => {
-        const targetId = scrollToMessage ? `message-${scrollToMessage}` : `file-${scrollToFile}`;
+      const targetId = scrollToMessage ? `message-${scrollToMessage}` : `file-${scrollToFile}`;
+      let aborted = false;
+      const timeouts: number[] = [];
+
+      const tryScroll = (attempt = 0) => {
+        if (aborted) return;
         const element = document.getElementById(targetId);
         if (element) {
-          element.scrollIntoView({ behavior: "smooth", block: "center" });
-          // Add a highlight effect
-          element.classList.add("ring-2", "ring-primary", "ring-opacity-50");
+          element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          element.classList.add('ring-2', 'ring-primary', 'ring-opacity-50');
           setTimeout(() => {
-            element.classList.remove("ring-2", "ring-primary", "ring-opacity-50");
+            element.classList.remove('ring-2', 'ring-primary', 'ring-opacity-50');
           }, 3000);
+
+          // Clear the deep-link query params now that the file/message is visible
+          try {
+            const url = new URL(window.location.href);
+            url.searchParams.delete('file');
+            url.searchParams.delete('message');
+            window.history.replaceState({}, '', url.pathname + url.search + url.hash);
+          } catch (e) {
+            console.warn('Failed to clear deep link params in UnifiedTimeline', e);
+          }
+
+          // Emit a global event so parent pages can react if needed
+          try {
+            const detail = { type: scrollToMessage ? 'message' : 'file', id: scrollToMessage || scrollToFile };
+            window.dispatchEvent(new CustomEvent('deep-link-handled', { detail } as any));
+          } catch (e) {
+            // ignore
+          }
+
+          return;
         }
-      }, 500);
-      return () => clearTimeout(timer);
+
+        // Retry a few times to wait for DOM to render
+        if (attempt < 7) {
+          const t = window.setTimeout(() => tryScroll(attempt + 1), 200);
+          timeouts.push(t as any);
+        } else {
+          // Give up after several attempts
+          console.warn(`[UnifiedTimeline] Could not find target element ${targetId} after multiple attempts`);
+        }
+      };
+
+      tryScroll();
+
+      return () => {
+        aborted = true;
+        for (const t of timeouts) window.clearTimeout(t as any);
+      };
     }
   }, [timelineItems.length, scrollToMessage, scrollToFile]);
 

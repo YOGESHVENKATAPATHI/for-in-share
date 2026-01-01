@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { Link } from "wouter";
 import { useAuth } from "@/hooks/use-auth";
@@ -36,6 +36,15 @@ export default function HomePage() {
   const isMobile = useIsMobile();
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
+  const [serverSearchResults, setServerSearchResults] = useState<any | null>(null);
+  const [isSearching, setIsSearching] = useState(false);
+  const [streamedLocalResults, setStreamedLocalResults] = useState<any[]>([]);
+  const localSSERef = useRef<EventSource | null>(null);
+  const [isStreamingLocal, setIsStreamingLocal] = useState(false);
+  const [streamedExtractedResults, setStreamedExtractedResults] = useState<any[]>([]);
+  const extractedSSERef = useRef<EventSource | null>(null);
+  const [isStreamingExtracted, setIsStreamingExtracted] = useState(false);
+  const [streamedForums, setStreamedForums] = useState<any[]>([]);
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
   const [selectedForum, setSelectedForum] = useState<ForumWithCreator | null>(null);
   const [ws, setWs] = useState<WebSocket | null>(null);
@@ -161,11 +170,172 @@ export default function HomePage() {
     });
 
     // Filter forums with score > 0 and sort by relevance
-    return scoredForums
+    let localMatches = scoredForums
       .filter(({ score }) => score > 0)
       .sort((a, b) => b.score - a.score)
       .map(({ forum }) => forum);
-  }, [forums, debouncedSearchQuery, forumTagsMap]);
+
+    // If server returned forums or files, include those too (promote forums that have matching files)
+    if (serverSearchResults) {
+      const map = new Map<string, any>();
+      // Start with server-provided forums (they are authoritative across DBs)
+      (serverSearchResults.forums || []).forEach((f: any) => map.set(f.id, f));
+      // Also map forums that own returned files (file.forum or file.forumId)
+      (serverSearchResults.files || []).forEach((file: any) => {
+        const forum = file.forum || forums?.find((ff: any) => ff.id === file.forumId) || null;
+        if (forum) map.set(forum.id, forum);
+      });
+      // Merge localMatches ensuring unique ordering: server forums first, then local matches
+      const serverFirst = Array.from(map.values());
+      const merged = [...serverFirst];
+      localMatches.forEach((f: any) => { if (!map.has(f.id)) merged.push(f); });
+      // Also append any streamed forums that are not present yet
+      streamedForums.forEach((sf: any) => { if (!map.has(sf.id)) merged.push(sf); });
+      return merged;
+    }
+
+    // If there are streamed forums from SSE, ensure they're included
+    const localSet = new Set(localMatches.map(f => f.id));
+    const mergedLocal = [...localMatches];
+    streamedForums.forEach(sf => { if (!localSet.has(sf.id)) mergedLocal.push(sf); });
+    return mergedLocal;
+  }, [forums, debouncedSearchQuery, forumTagsMap, serverSearchResults, streamedForums]);
+
+  // Query server search when query length >= 2 to include file/forum/message matches
+  useEffect(() => {
+    const q = debouncedSearchQuery.trim();
+    if (!q || q.length < 2) {
+      setServerSearchResults(null);
+      setIsSearching(false);
+      return;
+    }
+    let mounted = true;
+    (async () => {
+      try {
+        setIsSearching(true);
+        const enc = encodeURIComponent(q);
+        const res = await fetch(`/api/search?q=${enc}&limit=50`);
+        if (!mounted) return;
+        if (!res.ok) {
+          setServerSearchResults(null);
+          setIsSearching(false);
+          return;
+        }
+        const data = await res.json();
+        // If extracted DB should be analyzed only for Xmaster, run extracted-only endpoint when Xmaster forum exists
+        const hasXmaster = (forums || []).some((f: any) => f.name === 'Xmaster');
+        if (hasXmaster) {
+          try {
+            const res2 = await fetch(`/api/search/extracted?q=${enc}&limit=50`);
+            if (res2.ok) {
+              const extracted = await res2.json();
+              // Merge extracted files into data.files and include Xmaster forum if needed
+              data.files = Array.isArray(data.files) ? data.files.concat(extracted.files || []) : (extracted.files || []);
+            }
+          } catch (e) {
+            console.warn('Failed to fetch extracted search for home page', e);
+          }
+        }
+        setServerSearchResults(data);
+      } catch (err) {
+        console.warn('Home search failed', err);
+        setServerSearchResults(null);
+      } finally {
+        if (mounted) setIsSearching(false);
+      }
+    })();
+    return () => { mounted = false; };
+  }, [debouncedSearchQuery, forums]);
+
+  // Setup SSE streams to progressively update home search with forum matches
+  useEffect(() => {
+    // Reset any previous streamed results when query changes
+    setStreamedLocalResults([]);
+    setStreamedExtractedResults([]);
+    setStreamedForums([]);
+    if (localSSERef.current) { localSSERef.current.close(); localSSERef.current = null; }
+    if (extractedSSERef.current) { extractedSSERef.current.close(); extractedSSERef.current = null; }
+
+    const q = debouncedSearchQuery.trim();
+    if (!q || q.length < 2) return;
+
+    const enc = encodeURIComponent(q);
+    // Local stream
+    try {
+      setIsStreamingLocal(true);
+      const url = `/api/search/stream?q=${enc}`;
+      const es = new EventSource(url);
+      localSSERef.current = es;
+      es.onmessage = (ev) => {
+        try {
+          const parsed = JSON.parse(ev.data);
+          if (!parsed) return;
+          if (parsed.type === 'file' || parsed.type === 'message') {
+            const item = parsed.data;
+            setStreamedLocalResults(prev => {
+              if (prev.find(p => p.id === item.id)) return prev;
+              return [item, ...prev];
+            });
+            const forum = item.forum || forums?.find(f => f.id === item.forumId);
+            if (forum) {
+              setStreamedForums(prev => prev.find(f => f.id === forum.id) ? prev : [forum, ...prev]);
+            }
+          } else if (parsed.type === 'forum' && parsed.data) {
+            setStreamedForums(prev => prev.find(f => f.id === parsed.data.id) ? prev : [parsed.data, ...prev]);
+          }
+        } catch (err) {
+          console.warn('Failed to parse local SSE', err);
+        }
+      };
+      es.addEventListener('done', () => { setIsStreamingLocal(false); es.close(); localSSERef.current = null; });
+      es.onerror = (e) => { console.warn('Local SSE error', e); setIsStreamingLocal(false); try { es.close(); } catch {} localSSERef.current = null; };
+    } catch (e) {
+      console.warn('Failed to open local SSE on home page', e);
+      setIsStreamingLocal(false);
+    }
+
+    // Extracted SSE - only stream extracted DBs for Xmaster
+    const hasXmaster = (forums || []).some((f: any) => f.name === 'Xmaster');
+    if (hasXmaster) {
+      try {
+        setIsStreamingExtracted(true);
+        const url = `/api/search/extracted/stream?q=${enc}`;
+        const esx = new EventSource(url);
+        extractedSSERef.current = esx;
+        esx.onmessage = (ev) => {
+          try {
+            const parsed = JSON.parse(ev.data);
+            if (!parsed) return;
+            if (parsed.type === 'file' || parsed.type === 'message') {
+              const item = parsed.data;
+              setStreamedExtractedResults(prev => {
+                if (prev.find(p => p.id === item.id)) return prev;
+                return [item, ...prev];
+              });
+              const forum = item.forum || forums?.find(f => f.id === item.forumId);
+              if (forum) {
+                setStreamedForums(prev => prev.find(f => f.id === forum.id) ? prev : [forum, ...prev]);
+              }
+            }
+          } catch (err) {
+            console.warn('Failed to parse extracted SSE', err);
+          }
+        };
+        esx.addEventListener('done', () => { setIsStreamingExtracted(false); esx.close(); extractedSSERef.current = null; });
+        esx.onerror = (e) => { console.warn('Extracted SSE error', e); setIsStreamingExtracted(false); try { esx.close(); } catch {} extractedSSERef.current = null; };
+      } catch (e) {
+        console.warn('Failed to open extracted SSE on home page', e);
+        setIsStreamingExtracted(false);
+      }
+    }
+
+    return () => {
+      if (localSSERef.current) { localSSERef.current.close(); localSSERef.current = null; }
+      if (extractedSSERef.current) { extractedSSERef.current.close(); extractedSSERef.current = null; }
+      setIsStreamingLocal(false);
+      setIsStreamingExtracted(false);
+    };
+  }, [debouncedSearchQuery, forums]);
 
   // Track search when results change
   useEffect(() => {
@@ -302,6 +472,18 @@ export default function HomePage() {
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
           />
+          <div className="mt-3 flex items-center gap-3 text-xs text-zinc-400">
+            { (isSearching || isStreamingLocal || isStreamingExtracted ) ? (
+              <>
+                <div className="inline-block animate-spin h-4 w-4 rounded-full border-2 border-t-transparent border-zinc-100" />
+                <span>{isSearching ? 'Searching' : 'Searching updated results'} communities, files, and messages…</span>
+              </>
+            ) : serverSearchResults ? (
+              <span>{(serverSearchResults.forums || []).length} communities · {(serverSearchResults.files || []).length} files</span>
+            ) : (
+              <span>Search across forum names, tags, files, and messages.</span>
+            )}
+          </div>
         </div>
 
         {/* Responsive Forum Grid */}

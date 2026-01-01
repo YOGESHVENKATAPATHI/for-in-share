@@ -102,6 +102,8 @@ export default function ForumPage() {
   const [viewMode, setViewMode] = useState<"timeline" | "files">("timeline");
   const [previewFile, setPreviewFile] = useState<FileWithChunks | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
+  // Timeout ref used to defer clearing deep-link params so UI can render/scroll
+  const deepLinkClearTimeoutRef = useRef<number | null>(null);
   const [editingForumTags, setEditingForumTags] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
@@ -568,9 +570,37 @@ export default function ForumPage() {
       return [specificFile, ...prev];
     });
 
-    // Open preview to ensure the user sees the requested file immediately
-    setPreviewFile(specificFile);
-    setPreviewOpen(true);
+    // Ensure timeline view is active so the element exists and can be scrolled
+    setViewMode('timeline');
+
+    // Open preview only after UnifiedTimeline confirms it handled the deep link
+    // Add a one-time listener and a fallback timeout
+    let handled = false;
+    const onHandled = (ev: any) => {
+      if (ev?.detail?.type === 'file' && String(ev.detail.id) === String(scrollToFile)) {
+        handled = true;
+        setPreviewFile(specificFile);
+        setPreviewOpen(true);
+      }
+    };
+
+    window.addEventListener('deep-link-handled', onHandled);
+
+    // Fallback: if UnifiedTimeline didn't report handled within 2s, open preview anyway
+    const fallbackTimer = window.setTimeout(() => {
+      if (!handled) {
+        setPreviewFile(specificFile);
+        setPreviewOpen(true);
+      }
+      window.removeEventListener('deep-link-handled', onHandled);
+    }, 2000);
+    // Cleanup listeners/timers when scrollToFile or specificFile change
+    return () => {
+      try {
+        window.removeEventListener('deep-link-handled', onHandled);
+        window.clearTimeout(fallbackTimer);
+      } catch (e) {}
+    };
   }, [scrollToFile, specificFile]);
 
   const loadMoreFiles = async () => {
@@ -781,6 +811,7 @@ export default function ForumPage() {
     return () => window.removeEventListener('popstate', onPop);
   }, []);
 
+  // No deep-link timer cleanup required (UnifiedTimeline handles clearing). Keep existing forumId cleanup
   useEffect(() => {
     if (!forumId) {
       setShowPeoplePanel(false);

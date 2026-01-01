@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import Hls from "hls.js";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
+import { useToast } from "@/hooks/use-toast";
 import {
   Play,
   Pause,
@@ -58,6 +59,7 @@ export function VideoPreview({
   const [chunkInfoLoading, setChunkInfoLoading] = useState(false);
   const [chunkInfoLoaded, setChunkInfoLoaded] = useState(false);
   const [requestCache, setRequestCache] = useState<Set<string>>(new Set());
+  const { toast } = useToast();
 
   // Request counter for monitoring
   const [requestCount, setRequestCount] = useState({ chunkInfo: 0, metadata: 0, urlTest: 0, hlsPoll: 0 });
@@ -96,7 +98,110 @@ export function VideoPreview({
     setPlayed(0);
     setLoaded(0);
     console.log(`[VideoPreview] ✨ Reset duration states for ${file.fileName}`);
+
+    // Reset resolved proxied URL for extracted files
+    setResolvedProxiedUrl(null);
+    setResolvingExtracted(false);
   }, [file.id, file.fileName]);
+
+  // For extracted files (Xmaster), resolve live mp4/m3u8 via server which uses the Vercel proxy
+  useEffect(() => {
+    let mounted = true;
+    async function resolveExtracted() {
+      if (!file.id.startsWith('extracted_')) return;
+      if (!file.directDownloadUrl && !(file as any).videoUrl) return;
+      // Client-side TTL guard to avoid rapid repeated resolve calls
+      if (Date.now() - lastResolveAtRef.current < RESOLVE_TTL_MS) {
+        console.log('[VideoPreview] Skipping resolve (cached recently)');
+        return;
+      }
+      setResolvingExtracted(true);
+      setResolvedProxiedUrl(null);
+      try {
+        const res = await fetch(`/api/extracted/${file.id}/resolve`);
+        lastResolveAtRef.current = Date.now();
+        if (!mounted) return;
+        if (!res.ok) {
+          console.warn('[VideoPreview] Failed to resolve extracted url', res.status);
+          setResolvingExtracted(false);
+          return;
+        }
+        const js = await res.json();
+        console.log('[VideoPreview] Extracted resolve response:', js);
+        // Choose best playable URL in order: proxiedUrl (vercel) if healthy, else server proxy to resolvedUrl
+        const proxiedMeta = js?.proxiedMeta || null;
+        const resolvedMetaResp = js?.resolvedMeta || null;
+        const localProxyUrl = js?.localProxyUrl || null;
+        const localProxyMeta = js?.localProxyMeta || null;
+        let chosenUrl: string | null = null;
+
+        function metaIsPlayable(m: any) {
+          if (!m) return false;
+          if (m.error) return false;
+          if (m.status && m.status >= 400) return false;
+          const ct = (m.contentType || '').toLowerCase();
+          return /(video\/|application\/x-mpegurl)/i.test(ct);
+        }
+        function metaSupportsRanges(m: any) {
+          try { return !!(m && m.acceptRanges && String(m.acceptRanges).toLowerCase().includes('bytes')); } catch { return false; }
+        }
+
+        // Prefer local proxy (same-origin) when playable
+        if (localProxyUrl && metaIsPlayable(localProxyMeta)) {
+          chosenUrl = localProxyUrl;
+          setResolvedMeta(localProxyMeta || resolvedMetaResp || null);
+        }
+        // Next prefer Vercel proxied URL if it advertises video and ranges
+        else if (js && js.proxiedUrl && metaIsPlayable(proxiedMeta) && metaSupportsRanges(proxiedMeta)) {
+          chosenUrl = js.proxiedUrl;
+          setResolvedMeta(proxiedMeta || resolvedMetaResp || null);
+        }
+        // If direct resolved URL is playable, route it through our local proxy for better control
+        else if (js && js.resolvedUrl && metaIsPlayable(resolvedMetaResp)) {
+          chosenUrl = `/api/proxy?url=${encodeURIComponent(js.resolvedUrl)}`;
+          setResolvedMeta(resolvedMetaResp);
+        }
+        // Otherwise, try proxied URL even if it lacks range header
+        else if (js && js.proxiedUrl) {
+          chosenUrl = js.proxiedUrl;
+          setResolvedMeta(proxiedMeta || resolvedMetaResp || null);
+        } else if (js && js.resolvedUrl) {
+          chosenUrl = `/api/proxy?url=${encodeURIComponent(js.resolvedUrl)}`;
+          setResolvedMeta(resolvedMetaResp);
+        }
+
+        if (chosenUrl) {
+          // Avoid re-setting same URL repeatedly (which causes reload loops)
+          if (chosenUrl !== appliedSrcRef.current) {
+            setResolvedProxiedUrl(chosenUrl);
+            appliedSrcRef.current = chosenUrl;
+          } else {
+            console.log('[VideoPreview] chosenUrl equals appliedSrcRef.current, skipping re-apply');
+          }
+        }
+        // store local proxy if available for fallback
+        if (localProxyUrl) setResolvedLocalProxyUrl(localProxyUrl);
+        // Diagnostics and user notifications
+        if (proxiedMeta && (proxiedMeta.error || (proxiedMeta.status && proxiedMeta.status >= 400))) {
+          console.warn('[VideoPreview] Proxied URL upstream issue:', proxiedMeta);
+          toast({ title: 'Proxy issue', description: 'Vercel proxy returned an error; using fallback', variant: 'warning' });
+        }
+        if (!metaSupportsRanges(proxiedMeta) && !metaSupportsRanges(localProxyMeta)) {
+          // Neither proxy supports ranges according to headers — playback may still work but seeking won't
+          toast({ title: 'Playback limitation', description: 'Upstream does not advertise range support; seeking may be limited', variant: 'warning' });
+        }
+        if (resolvedMetaResp && !(resolvedMetaResp.error) && !(resolvedMetaResp.status && resolvedMetaResp.status >= 400) && !/(video\/|application\/x-mpegurl)/i.test(resolvedMetaResp.contentType || '')) {
+          toast({ title: 'Playback may fail', description: `Upstream content-type: ${resolvedMetaResp.contentType || 'unknown'}`, variant: 'warning' });
+        }
+      } catch (err) {
+        console.warn('[VideoPreview] Error resolving extracted url', err);
+      } finally {
+        if (mounted) setResolvingExtracted(false);
+      }
+    }
+    resolveExtracted();
+    return () => { mounted = false; };
+  }, [file.id, file.directDownloadUrl, (file as any).videoUrl]);
 
   // Test URLs accessibility (run once when file changes)
   useEffect(() => {
@@ -162,6 +267,16 @@ export function VideoPreview({
   const [transcoding, setTranscoding] = useState(false);
   const hlsRef = useRef<Hls | null>(null);
 
+  // Resolved proxied URL for extracted (Xmaster) files
+  const [resolvedProxiedUrl, setResolvedProxiedUrl] = useState<string | null>(null);
+  const [resolvedLocalProxyUrl, setResolvedLocalProxyUrl] = useState<string | null>(null);
+  const [resolvingExtracted, setResolvingExtracted] = useState(false);
+  const [resolvedMeta, setResolvedMeta] = useState<any>(null);
+  const fallbackAttemptRef = useRef<{ triedLocal?: boolean }>({});
+  const lastResolveAtRef = useRef<number>(0);
+  const RESOLVE_TTL_MS = 60 * 1000; // 60s client-side TTL to avoid repeated resolves
+  const appliedSrcRef = useRef<string | null>(null); // last src applied to video element
+
   // Memoize the base streaming URL to prevent constant recalculation
   const baseStreamingUrl = useMemo(() => {
     // Always use stream endpoint for both user and admin files
@@ -173,18 +288,35 @@ export function VideoPreview({
   const getStreamingUrl = useCallback((seekTime?: number) => {
     const totalDuration = metadataDuration || duration;
     
-    console.log(`[VideoPreview] getStreamingUrl called with seekTime: ${seekTime}, smartSeeking: ${smartSeekingEnabled}, totalDuration: ${totalDuration}, metadataDuration: ${metadataDuration}`);
-    console.log(`[VideoPreview] File details - isAdminCreated: ${file.isAdminCreated}, mimeType: ${file.mimeType}, fileName: ${file.fileName}`);
-    console.log(`[VideoPreview] Retrieved URL from DB: ${file.directDownloadUrl}`);
-    if ((file as any).videoUrl) {
-      console.log(`[VideoPreview] Video URL from extracted DB: ${(file as any).videoUrl}`);
+    // Throttle verbose logs to avoid noisy repeats
+    const now = Date.now();
+    if (!((getStreamingUrl as any)._lastLogTime && (now - (getStreamingUrl as any)._lastLogTime < 5000))) {
+      console.log(`[VideoPreview] getStreamingUrl called with seekTime: ${seekTime}, smartSeeking: ${smartSeekingEnabled}, totalDuration: ${totalDuration}, metadataDuration: ${metadataDuration}`);
+      console.log(`[VideoPreview] File details - isAdminCreated: ${file.isAdminCreated}, mimeType: ${file.mimeType}, fileName: ${file.fileName}`);
+      console.log(`[VideoPreview] Retrieved URL from DB: ${file.directDownloadUrl}`);
+      if ((file as any).videoUrl) {
+        console.log(`[VideoPreview] Video URL from extracted DB: ${(file as any).videoUrl}`);
+      }
+      (getStreamingUrl as any)._lastLogTime = now;
     }
     
     // Special handling for extracted files (from external DB)
-    if (file.id.startsWith('extracted_') && file.directDownloadUrl) {
-      const proxiedUrl = `https://media-alpha-vert.vercel.app/api/proxy?url=${encodeURIComponent(file.directDownloadUrl)}`;
-      console.log(`[VideoPreview] Extracted file detected - using proxied URL: ${proxiedUrl}`);
-      return proxiedUrl;
+    if (file.id.startsWith('extracted_') && (file.directDownloadUrl || (file as any).videoUrl)) {
+      // Prefer a freshly-resolved proxied URL from server (uses Vercel proxy), fallback to stored directDownloadUrl proxied
+      if (resolvedProxiedUrl) {
+        // Only log when resolved URL actually changes to reduce spam
+        if (!((getStreamingUrl as any)._lastResolved === resolvedProxiedUrl)) {
+          console.log(`[VideoPreview] Using resolved proxied URL for extracted file: ${resolvedProxiedUrl}`);
+          (getStreamingUrl as any)._lastResolved = resolvedProxiedUrl;
+        }
+        return resolvedProxiedUrl;
+      }
+      const fallback = file.directDownloadUrl ? `https://media-alpha-vert.vercel.app/api/proxy?url=${encodeURIComponent(file.directDownloadUrl)}` : (`/api/files/${file.id}/stream`);
+      if (!((getStreamingUrl as any)._lastFallback === fallback)) {
+        console.log(`[VideoPreview] Extracted file - using fallback proxied URL: ${fallback}`);
+        (getStreamingUrl as any)._lastFallback = fallback;
+      }
+      return fallback;
     }
     
     // For user-uploaded files (non-admin), use stream URL for proper seeking support
@@ -470,6 +602,63 @@ export function VideoPreview({
       if (autoPlay) playerRef.current.play();
     }
   }, [hlsUrl, autoPlay]);
+
+  // Immediately load and play resolved URL when available
+  useEffect(() => {
+    if (!resolvedProxiedUrl) return;
+    // Reset fallback attempts
+    fallbackAttemptRef.current = {};
+
+    const video = playerRef.current;
+    const isM3u8 = /\.m3u8(\?|$)/i.test(resolvedProxiedUrl) || (resolvedMeta && /application\/x-mpegurl/i.test(resolvedMeta.contentType || ''));
+
+    if (isM3u8) {
+      console.log('[VideoPreview] Resolved HLS URL, initializing HLS:', resolvedProxiedUrl);
+      if (resolvedProxiedUrl !== appliedSrcRef.current) {
+        setHlsUrl(resolvedProxiedUrl);
+        appliedSrcRef.current = resolvedProxiedUrl;
+      } else {
+        console.log('[VideoPreview] HLS URL already applied, skipping');
+      }
+      setTranscoding(false);
+      return;
+    }
+
+    if (video) {
+      try {
+        // Destroy any HLS instance if present
+        if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
+        // Only change src if it's different to avoid reload loops
+        const currentAttr = video.getAttribute('src');
+        if (currentAttr !== resolvedProxiedUrl) {
+          console.log('[VideoPreview] Forcing video element to use resolved URL:', resolvedProxiedUrl);
+          video.pause();
+          video.setAttribute('src', resolvedProxiedUrl);
+          video.load();
+          setIsReady(false);
+          // Auto-play when requested
+          if (autoPlay) video.play().catch(e => console.warn('[VideoPreview] Auto-play failed', e));
+        } else {
+          console.log('[VideoPreview] Resolved URL already set on element, skipping');
+        }
+      } catch (e) {
+        console.warn('[VideoPreview] Error applying resolved URL to video element', e);
+      }
+    }
+
+    // If the video doesn't start loading within 5s, try fallback to local proxy if available
+    const fallbackTimer = setTimeout(() => {
+      const v = playerRef.current;
+      const isLoaded = v ? (v.readyState >= 1 || isReady) : false;
+      if (!isLoaded && resolvedLocalProxyUrl && !fallbackAttemptRef.current.triedLocal) {
+        console.log('[VideoPreview] Resolved URL not loading, falling back to local proxy:', resolvedLocalProxyUrl);
+        fallbackAttemptRef.current.triedLocal = true;
+        setResolvedProxiedUrl(resolvedLocalProxyUrl);
+      }
+    }, 5000);
+
+    return () => clearTimeout(fallbackTimer);
+  }, [resolvedProxiedUrl, resolvedLocalProxyUrl, resolvedMeta, autoPlay, isReady]);
 
   // Log important state changes only
   useEffect(() => {

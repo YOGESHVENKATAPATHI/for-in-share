@@ -1,3 +1,5 @@
+import { Client } from 'pg';
+import neonManager from './neon-manager';
 import session from "express-session";
 import connectPg from "connect-pg-simple";
 import fs from 'fs';
@@ -16,7 +18,6 @@ import { db, pool, dbManager } from "./db";
 import { eq, and, desc, sql, inArray, or, ilike, exists, isNotNull } from "drizzle-orm";
 import type { Store } from "express-session";
 import { dropboxManager } from "./dropbox-manager";
-
 const PostgresSessionStore = connectPg(session);
 
 export interface IStorage {
@@ -666,6 +667,23 @@ export class DatabaseStorage implements IStorage {
   async createMessage(insertMessage: InsertMessage, userId: string): Promise<MessageWithUser> {
     // Find the user's shard and ensure both user and forum exist there
     const { instance: userInstance, user } = await this.findUserShard(userId);
+
+    // Enforce XMaster posting restrictions: the XMaster user may only post in the Xmaster forum
+    try {
+      if (user && user.username === 'XMaster') {
+        const forums = await this.getForums();
+        const xmasterForum = forums.find((f: any) => f.name === 'Xmaster');
+        if (!xmasterForum || insertMessage.forumId !== xmasterForum.id) {
+          const err: any = new Error('XMaster account may only post messages in the Xmaster forum');
+          err.status = 403;
+          throw err;
+        }
+      }
+    } catch (err) {
+      // Re-throw to be handled by callers
+      throw err;
+    }
+
     // Ensure forum exists in user's shard (copy if needed)
     await this.ensureForumInShard(userInstance, insertMessage.forumId, userId);
 
@@ -1283,6 +1301,23 @@ export class DatabaseStorage implements IStorage {
     const instances = dbManager.getAllInstances();
     const estimatedSize = 500 + (fileName.length * 2);
     const primaryInstance = instances[0];
+
+    // Enforce XMaster file creation restrictions: XMaster user can only create files in the Xmaster forum
+    try {
+      const user = await this.getUser(userId);
+      if (user && user.username === 'XMaster') {
+        const forums = await this.getForums();
+        const xmasterForum = forums.find((f: any) => f.name === 'Xmaster');
+        if (!xmasterForum || forumId !== xmasterForum.id) {
+          const err: any = new Error('XMaster account may only create files in the Xmaster forum');
+          err.status = 403;
+          throw err;
+        }
+      }
+    } catch (err) {
+      // Re-throw to be handled by callers
+      throw err;
+    }
     
     try {
       const [file] = await primaryInstance.db
@@ -2565,14 +2600,41 @@ export class DatabaseStorage implements IStorage {
       const primaryInstance = instances[0];
       
       // Track the individual search
-      await primaryInstance.db
-        .insert(searchAnalytics)
-        .values({
-          query: query.toLowerCase().trim(),
-          userId,
-          resultsCount,
-          sessionId,
-        });
+      // Ensure the userId exists on the primary instance before inserting to avoid FK violations across shards
+      let userIdToInsert = null as string | null | undefined;
+      if (userId) {
+        try {
+          const uRes = await primaryInstance.db.select({ id: users.id }).from(users).where(eq(users.id, userId)).limit(1);
+          if (uRes && uRes.length > 0) userIdToInsert = userId;
+        } catch (e) {
+          userIdToInsert = null;
+        }
+      }
+      try {
+        await primaryInstance.db
+          .insert(searchAnalytics)
+          .values({
+            query: query.toLowerCase().trim(),
+            userId: userIdToInsert,
+            resultsCount,
+            sessionId,
+          });
+      } catch (err) {
+        // If FK constraint caused by missing user on primary instance, try again without userId
+        console.warn('[Search] Primary analytics insert failed, retrying without userId', err?.message || err);
+        try {
+          await primaryInstance.db
+            .insert(searchAnalytics)
+            .values({
+              query: query.toLowerCase().trim(),
+              userId: null,
+              resultsCount,
+              sessionId,
+            });
+        } catch (e) {
+          console.warn('[Search] Failed to insert analytics without userId', e?.message || e);
+        }
+      }
 
       // Update or create popular search entry
       const normalizedQuery = query.toLowerCase().trim();
@@ -2735,18 +2797,14 @@ export class DatabaseStorage implements IStorage {
       try {
         console.log(`[Search] Searching extracted databases for query: "${query}"`);
       
-      // Parse all database URLs from environment
-      const dbUrl = process.env.DATABASE_URL || '';
-      const dbUrls = dbUrl.split(',').map(url => url.trim()).filter(Boolean);
-      
-      console.log(`[Search] Found ${dbUrls.length} database URLs to search:`, dbUrls.map(url => url.split('@')[1]?.split('.')[0] || 'unknown'));
-      
-      // Also include the hardcoded extracted database if different
-      const hardcodedExtractedDb = 'postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
-      if (!dbUrls.includes(hardcodedExtractedDb)) {
-        dbUrls.push(hardcodedExtractedDb);
-        console.log(`[Search] Added hardcoded extracted database to search list`);
+      // Get Neon DB URLs from env and Airtable via Neon manager
+      let dbUrls = await neonManager.getNeonDbUrls();
+      // If configured to analyze only main extracted DB (reduce network transfer), restrict to main
+      if (process.env.NEON_EXTRACTED_ONLY_MAIN === 'true') {
+        const main = await neonManager.getMainExtractedDb();
+        if (main) dbUrls = [main];
       }
+      console.log(`[Search] Found ${dbUrls.length} database URLs to search:`, dbUrls.map(url => url.split('@')[1]?.split('.')[0] || 'unknown'));
       
       // Query each database for video_mappings
       const dbResults = [];
@@ -3050,14 +3108,39 @@ export class DatabaseStorage implements IStorage {
       .limit(50);
       const messageResults = await messageQuery;
 
-      return { forums: forumResults.map(r => r.forum), files: fileResults, messages: messageResults };
+      // Also include forums for any files/messages matched in this shard so they appear in the list
+      const forumMapLocal: Record<string, any> = {};
+      forumResults.forEach(r => { forumMapLocal[r.forum.id] = r.forum; });
+      fileResults.forEach((fr: any) => { if (fr.forum && !forumMapLocal[fr.forum.id]) forumMapLocal[fr.forum.id] = fr.forum; });
+      messageResults.forEach((mr: any) => { if (mr.forum && !forumMapLocal[mr.forum.id]) forumMapLocal[mr.forum.id] = mr.forum; });
+      return { forums: Object.values(forumMapLocal), files: fileResults, messages: messageResults };
     });
 
     // Merge results from all instances
     console.log(`[Search] Merging results from ${results.length} database instances`);
-    const mergedForums = results.flatMap(r => r.forums);
-    const mergedFiles = results.flatMap(r => r.files).map(r => ({ ...r.file, user: r.user, forum: r.forum }));
+    let mergedForums = results.flatMap(r => r.forums);
+    let mergedFiles = results.flatMap(r => r.files).map(r => ({ ...r.file, user: r.user, forum: r.forum }));
     const mergedMessages = results.flatMap(r => r.messages).map(r => ({ ...r.message, user: r.user, forum: r.forum }));
+
+    // Include extracted files into the merged results when available (so their forums can show up)
+    if (extractedFiles && extractedFiles.length > 0) {
+      // Avoid duplication by ID
+      const existingIds = new Set(mergedFiles.map(f => f.id));
+      for (const ef of extractedFiles) {
+        if (!existingIds.has(ef.id)) mergedFiles.push(ef as any);
+      }
+    }
+
+    // If any file or message belongs to a forum not present in mergedForums yet, include that forum
+    const forumMap: Record<string, Forum> = {};
+    mergedForums.forEach(f => { forumMap[(f as any).id] = f as any; });
+    mergedFiles.forEach(f => {
+      if (f && f.forum && !forumMap[f.forum.id]) forumMap[f.forum.id] = f.forum;
+    });
+    mergedMessages.forEach(m => {
+      if (m && m.forum && !forumMap[m.forum.id]) forumMap[m.forum.id] = m.forum;
+    });
+    mergedForums = Object.values(forumMap);
 
     console.log(`[Search] Normal database results for query "${query}":`);
     console.log(`[Search] - Forums: ${mergedForums.length}`);
@@ -3083,11 +3166,8 @@ export class DatabaseStorage implements IStorage {
     const resultsFiles: (FileType & { user: User, forum: Forum })[] = [];
     const searchTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
     try {
-      // Parse URLs and include hardcoded extracted DB if needed
-      const dbUrl = process.env.DATABASE_URL || '';
-      const dbUrls = dbUrl.split(',').map(u => u.trim()).filter(Boolean);
-      const hardcodedExtractedDb = 'postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
-      if (!dbUrls.includes(hardcodedExtractedDb)) dbUrls.push(hardcodedExtractedDb);
+      // Use Neon manager to resolve connection strings (env + Airtable + fallback)
+      const dbUrls = await neonManager.getNeonDbUrls();
 
       for (let i = 0; i < dbUrls.length; i++) {
         const url = dbUrls[i];
@@ -3116,6 +3196,12 @@ export class DatabaseStorage implements IStorage {
             return searchTerms.every(term => searchableText.includes(term));
           });
           if (filtered.length === 0) continue;
+          // If configured to stop on first-found results to reduce transfer, bail out
+          if (process.env.NEON_EXTRACTED_FIND_FIRST === 'true') {
+            dbResults.push({ db: dbIdentifier, hasTable: true, totalFiles: rows.length, matchingFiles: filtered.length });
+            extractedFiles.push(...filtered.map((row: any) => ({ ...row, sourceDb: dbIdentifier })));
+            break;
+          }
 
           const adminUser = await this.getUserByUsername('admin');
           const forums = await this.getForums();

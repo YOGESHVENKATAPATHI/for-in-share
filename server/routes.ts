@@ -15,6 +15,7 @@ import { dbManager } from "./db";
 import { insertForumSchema, insertMessageSchema, insertCommentSchema, insertAccessRequestSchema, users, forums, forumMembers, messages, files, fileTags, tags, messageTags, forumTags } from "@shared/schema";
 import { fromZodError } from "zod-validation-error";
 import fetch from "node-fetch";
+import fs from 'fs';
 import { keepAliveService } from "./keep-alive";
 import { eq, and, or, ilike, exists, isNotNull, sql } from "drizzle-orm";
 import { distributedChunkManager } from "./distributed-chunk-manager";
@@ -1035,12 +1036,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
         await storage.deletePartialUpload(partialUpload.id);
 
         // Broadcast file upload completion to all clients in the forum
+        // Attach full user object to avoid 'Unknown' display on clients that receive this event
+        const uploader = await storage.getUser(req.user!.id);
+        const fileWithUser = { ...file, user: uploader };
+
         clients.forEach((c) => {
           if (c.ws.readyState === WebSocket.OPEN) {
             c.ws.send(JSON.stringify({
               type: 'file_uploaded',
               forumId: forumId,
-              file: file
+              data: {
+                file: fileWithUser,
+                filename: fileWithUser.fileName,
+                forumId: forumId
+              }
             }));
           }
         });
@@ -2812,6 +2821,62 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
       }
 
+      // If this is an extracted file, resolve the live mp4/m3u8 and stream it via our proxy (preserve Range support)
+      if (isExtractedFile) {
+        try {
+          // Build absolute URL to our resolve endpoint to reuse its logic and cache
+          let hostHeader = req.get('host') || 'localhost:5000';
+          hostHeader = hostHeader.replace('[::1]', '127.0.0.1').replace('::1', '127.0.0.1');
+          const resolveUrl = `${req.protocol}://${hostHeader}/api/extracted/${encodeURIComponent(req.params.id)}/resolve`;
+
+          console.log(`[Download] Resolving extracted file via ${resolveUrl}`);
+          const r = await fetch(resolveUrl, { headers: { 'User-Agent': 'Node.js' } });
+          if (!r.ok) {
+            console.warn('[Download] Failed to resolve extracted file', await r.text());
+            return res.status(502).send('Failed to resolve extracted file');
+          }
+
+          const body = await r.json();
+          const chosenProxy = body.localProxyUrl ? `${req.protocol}://${hostHeader}${body.localProxyUrl}` : body.proxiedUrl || body.resolvedUrl;
+          if (!chosenProxy) return res.status(404).send('Could not resolve mp4 for this extracted file');
+
+          console.log(`[Download] Streaming resolved URL for ${file.fileName}: ${chosenProxy}`);
+
+          // Forward Range header if present
+          const upstreamHeaders: any = { 'User-Agent': 'Node.js' };
+          if (req.headers.range) upstreamHeaders['Range'] = req.headers.range as string;
+
+          const upstreamResp = await fetch(chosenProxy, { headers: upstreamHeaders });
+          if (!upstreamResp.ok && upstreamResp.status !== 206) {
+            console.warn('[Download] Upstream fetch failed:', upstreamResp.status);
+            return res.status(502).send('Failed to fetch resolved file');
+          }
+
+          // Copy relevant headers
+          const contentType = upstreamResp.headers.get('content-type') || file.mimeType || 'application/octet-stream';
+          const contentLength = upstreamResp.headers.get('content-length');
+          const contentRange = upstreamResp.headers.get('content-range');
+
+          res.setHeader('Content-Type', contentType);
+          res.setHeader('Accept-Ranges', 'bytes');
+          if (contentLength) res.setHeader('Content-Length', contentLength);
+          if (contentRange) {
+            res.status(206);
+            res.setHeader('Content-Range', contentRange);
+          } else {
+            // For downloads prefer attachment
+            res.setHeader('Content-Disposition', `attachment; filename="${file.fileName}"`);
+          }
+
+          // Stream the response body
+          upstreamResp.body?.pipe(res);
+          return;
+        } catch (err) {
+          console.error('[Download] Error resolving extracted file:', err);
+          return res.status(500).send('Error resolving extracted file');
+        }
+      }
+
       // Check if this is an admin-created file with direct download URL
       if (file.isAdminCreated && file.directDownloadUrl) {
         // Special handling for M3U8 files - transcode to MP4 for download
@@ -4046,6 +4111,96 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Trigger Neon extracted replication between Neon DBs (admin only)
+  app.post('/api/neon/replicate', requireAuth, async (req, res, next) => {
+    try {
+      const targetConn = (req.body && req.body.targetConn) || undefined;
+      const neonManagerImport = await import('./neon-manager');
+      const neonManager = neonManagerImport.default;
+      const urls = await neonManager.getNeonDbUrls();
+      if (!urls || urls.length < 2) return res.status(400).json({ ok: false, message: 'No available Neon DBs to replicate to' });
+      const primary = urls[0];
+      if (targetConn) {
+        // Run replication synchronously and return results
+        const result = await neonManager.default.replicateExtractedVideoMappings(primary, targetConn);
+        return res.json({ ok: true, inserted: result.inserted, skipped: result.skipped });
+      }
+      // Pick the first non-primary as target
+      const target = urls.find(u => u !== primary);
+      if (!target) return res.status(400).json({ ok: false, message: 'No target Neon DB found' });
+      // Run in background
+      (async () => {
+        try {
+          const result = await neonManager.default.replicateExtractedVideoMappings(primary, target);
+          console.log('[Neon] Background replication finished:', result);
+        } catch (err) {
+          console.warn('[Neon] Background replication failed', err);
+        }
+      })();
+      return res.status(202).json({ ok: true, message: 'Replication started', target });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Import backup JSON file into a suitable Neon DB (admin only)
+  app.post('/api/neon/import-backup', requireAuth, async (req, res, next) => {
+    try {
+      const { targetConn, filePath } = req.body || {};
+      const neonManager = await import('./neon-manager');
+      const urls = await neonManager.default.getNeonDbUrls();
+      if (!urls || urls.length === 0) return res.status(400).json({ ok: false, message: 'No Neon DBs available' });
+
+      let target = targetConn;
+      if (!target) {
+        // Pick smallest DB size (prefer zero size)
+        let minSize = Number.MAX_SAFE_INTEGER;
+        let chosen = urls[0];
+        for (const u of urls) {
+          const size = await neonManager.getDbSizeBytes(u);
+          if (size === null) continue;
+          if (size === 0) { chosen = u; break; }
+          if (size < minSize) { minSize = size; chosen = u; }
+        }
+        target = chosen;
+      }
+
+      const candidatePath = filePath || path.resolve(process.cwd(), 'video_mappings.json');
+      if (!fs.existsSync(candidatePath)) return res.status(404).json({ ok: false, message: 'Backup file not found' });
+
+      // Run import in background to avoid timeouts
+      (async () => {
+        try {
+          const result = await neonManager.importVideoMappingsFromJson(target as string, candidatePath);
+          console.log('[NeonImport] Import completed', result);
+          // After successful import, set this target as main extracted DB
+          try { await neonManager.setMainExtractedDb(target as string); } catch (e) { console.warn('Failed to set main extracted DB', e); }
+        } catch (err) {
+          console.warn('[NeonImport] Import failed', err?.message || err);
+        }
+      })();
+
+      return res.status(202).json({ ok: true, message: 'Import started', target });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // List Neon DBs and current db sizes (admin only)
+  app.get('/api/neon/list', requireAuth, async (req, res, next) => {
+    try {
+      const neonManagerImport = await import('./neon-manager');
+      const neonManager = neonManagerImport.default;
+      const urls = await neonManager.getNeonDbUrls();
+      const list = [];
+      for (const u of urls) {
+        const size = await neonManager.getDbSizeBytes(u);
+        list.push({ url: u, size });
+      }
+      return res.json({ ok: true, list });
+    } catch (err) { next(err); }
+  });
+
   // SSE Search stream for local DBs
   app.get('/api/search/stream', optionalAuth, async (req, res, next) => {
     try {
@@ -4188,7 +4343,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
             .leftJoin(forumMembers, and(eq(forumMembers.forumId, forums.id), userId ? eq(forumMembers.userId, userId) : sql`1=0`))
             .where(and(
               or(eq(forums.isPublic, true), userId ? eq(forums.creatorId, userId) : sql`1=0`, userId ? isNotNull(forumMembers.id) : sql`1=0`),
-              or(ilike(forums.name, lower), ilike(forums.description, lower), exists(instance.db.select().from(forumTags).innerJoin(tags, eq(forumTags.tagId, tags.id)).where(and(eq(forumTags.forumId, forums.id), ilike(tags.name, lower)))))
+              or(
+                ilike(forums.name, lower),
+                ilike(forums.description, lower),
+                exists(instance.db.select().from(forumTags).innerJoin(tags, eq(forumTags.tagId, tags.id)).where(and(eq(forumTags.forumId, forums.id), ilike(tags.name, lower)))),
+                exists(instance.db.select().from(files).where(and(eq(files.forumId, forums.id), or(
+                  ilike(files.fileName, lower),
+                  and(isNotNull(files.metaTitle), ilike(files.metaTitle, lower)),
+                  and(isNotNull(files.metaDescription), ilike(files.metaDescription, lower)),
+                  and(isNotNull(files.keywords), ilike(files.keywords, lower)),
+                  and(isNotNull(files.adminNotes), ilike(files.adminNotes, lower))
+                )))),
+                exists(instance.db.select().from(messages).where(and(eq(messages.forumId, forums.id), or(
+                  ilike(messages.content, lower),
+                  exists(instance.db.select().from(messageTags).innerJoin(tags, eq(messageTags.tagId, tags.id)).where(and(eq(messageTags.messageId, messages.id), ilike(tags.name, lower))))
+                ))))
+              )
             ));
           const forumRows = await forumQuery.limit(20);
           for (const r of forumRows) {
@@ -4231,10 +4401,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.flushHeaders?.();
 
       // Stream extracted DBs progressively by querying each Neon DB and streaming matching rows as they are found
-      const dbUrl = process.env.DATABASE_URL || '';
-      const dbUrls = dbUrl.split(',').map(u => u.trim()).filter(Boolean);
-      const hardcodedExtractedDb = 'postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
-      if (!dbUrls.includes(hardcodedExtractedDb)) dbUrls.push(hardcodedExtractedDb);
+      const dbUrls = await (await import('./neon-manager')).default.getNeonDbUrls();
 
       const searchTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
       const batchSize = 5; // small batch for progressive fetching and streaming
@@ -4316,6 +4483,157 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.write(`event: count\ndata: ${JSON.stringify({ source: 'extracted', count: extractedStreamedCount })}\n\n`);
       res.write(`event: done\ndata: {}\n\n`);
       res.end();
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Resolve extracted item live via Vercel proxy (uses cache)
+  const resolvedExtractedCache = new Map(); // key: extractedId, value: { proxiedUrl, resolvedUrl, ts }
+  const RESOLVE_TTL_MS = 60 * 1000; // 60s cache
+  const VERCEL_PROXY_BASE = process.env.VERCEL_PROXY_BASE || 'https://webproxier-ov6et6gpw-ogeshs-projects.vercel.app/api/proxy?url=';
+
+  app.get('/api/extracted/:id/resolve', optionalAuth, async (req, res, next) => {
+    try {
+      const idParam = req.params.id;
+      if (!idParam || !idParam.startsWith('extracted_')) return res.status(400).json({ error: 'Invalid extracted id' });
+      // Check cache
+      const cacheKey = idParam;
+      const cached = resolvedExtractedCache.get(cacheKey);
+      if (cached && (Date.now() - cached.ts) < RESOLVE_TTL_MS) {
+        return res.json({ ok: true, resolvedUrl: cached.resolvedUrl, proxiedUrl: cached.proxiedUrl, cached: true });
+      }
+
+      // Use storage helper to get extracted record
+      const file = await storage.getFileById(idParam);
+      if (!file) return res.status(404).json({ error: 'Extracted file not found' });
+
+      // The original video page (xvideos) is stored in file.videoUrl or directDownloadUrl
+      const videoPage = (file as any).videoUrl || file.directDownloadUrl;
+      if (!videoPage) return res.status(400).json({ error: 'No source video page available to resolve' });
+
+      // Fetch the page via the Vercel proxy
+      const fetchUrl = `${VERCEL_PROXY_BASE}${encodeURIComponent(videoPage)}`;
+      console.log('[ExtractResolve] Fetching via vercel proxy:', fetchUrl);
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 20000);
+      try {
+        const r = await fetch(fetchUrl, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!r.ok) return res.status(502).json({ error: 'Failed to fetch source page', status: r.status });
+        const html = await r.text();
+        // Try to parse ld+json
+        let resolvedUrl: string | null = null;
+        try {
+          const cheerioMod = await import('cheerio');
+          const cheerio = cheerioMod && (cheerioMod.default || cheerioMod);
+          if (!cheerio || typeof cheerio.load !== 'function') throw new Error('cheerio not available');
+          const $ = cheerio.load(html);
+          const ld = $('script[type="application/ld+json"]').html();
+          if (ld) {
+            try {
+              const meta = JSON.parse(ld);
+              if (meta && meta.contentUrl) {
+                if (typeof meta.contentUrl === 'string') resolvedUrl = meta.contentUrl;
+                else if (Array.isArray(meta.contentUrl) && meta.contentUrl.length > 0) resolvedUrl = meta.contentUrl[0];
+              }
+            } catch (e) {
+              // ignore parse errors
+            }
+          }
+        } catch (err) {
+          console.warn('[ExtractResolve] Cheerio parse failed', err && err.message);
+        }
+
+        // Fallback: search for direct .mp4 links in HTML
+        if (!resolvedUrl) {
+          const mp4Match = html.match(/https?:\/\/[^'"\s>]+\.mp4[^'"\s]*/i);
+          if (mp4Match) resolvedUrl = mp4Match[0];
+        }
+
+        if (!resolvedUrl) {
+          // As a final fallback, use the stored directDownloadUrl
+          resolvedUrl = file.directDownloadUrl || null;
+        }
+
+        if (!resolvedUrl) return res.status(404).json({ error: 'Could not resolve mp4 or m3u8 url from page' });
+
+        const proxiedUrl = `${VERCEL_PROXY_BASE}${encodeURIComponent(resolvedUrl)}`;
+        // Perform a quick HEAD or small ranged GET to collect headers for diagnostics
+        let resolvedMeta: any = {};
+        try {
+          // Prefer HEAD but some servers block HEAD - try HEAD first
+          let headResp = null;
+          try {
+            headResp = await fetch(resolvedUrl, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0' } });
+          } catch (hErr) {
+            // HEAD failed, try small ranged GET
+            try {
+              const r = await fetch(resolvedUrl, { headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' } });
+              resolvedMeta = { status: r.status, contentType: r.headers.get('content-type'), acceptRanges: r.headers.get('accept-ranges') };
+            } catch (gErr) {
+              resolvedMeta = { error: (gErr && gErr.message) || String(gErr) };
+            }
+          }
+          if (headResp) {
+            resolvedMeta = { status: headResp.status, contentType: headResp.headers.get('content-type'), acceptRanges: headResp.headers.get('accept-ranges') };
+          }
+        } catch (metaErr) {
+          resolvedMeta = { error: (metaErr && metaErr.message) || String(metaErr) };
+        }
+
+        // Also check proxied URL (vercel proxy) headers for diagnostic purposes
+        let proxiedMeta: any = {};
+        try {
+          try {
+            const pj = await fetch(proxiedUrl, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0' } });
+            proxiedMeta = { status: pj.status, contentType: pj.headers.get('content-type'), acceptRanges: pj.headers.get('accept-ranges') };
+          } catch (pErr) {
+            try {
+              const pr = await fetch(proxiedUrl, { headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' } });
+              proxiedMeta = { status: pr.status, contentType: pr.headers.get('content-type'), acceptRanges: pr.headers.get('accept-ranges') };
+            } catch (pErr2) {
+              proxiedMeta = { error: (pErr2 && pErr2.message) || String(pErr2) };
+            }
+          }
+        } catch (e) {
+          proxiedMeta = { error: (e && e.message) || String(e) };
+        }
+
+        // Also check our local proxy endpoint for better compatibility (same-origin, range support)
+        const localProxyUrl = `/api/proxy?url=${encodeURIComponent(resolvedUrl)}`;
+        // Build absolute URL for server-side fetch (relative fetch fails in Node). Avoid IPv6 loopback issues by mapping ::1 to 127.0.0.1
+        let hostHeader = req.get('host') || 'localhost:5000';
+        hostHeader = hostHeader.replace('[::1]', '127.0.0.1').replace('::1', '127.0.0.1');
+        const localProxyAbsolute = `${req.protocol}://${hostHeader}${localProxyUrl}`;
+        let localProxyMeta: any = {};
+        try {
+          try {
+            const lj = await fetch(localProxyAbsolute, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0' } });
+            localProxyMeta = { status: lj.status, contentType: lj.headers.get('content-type'), acceptRanges: lj.headers.get('accept-ranges') };
+          } catch (lErr) {
+            try {
+              const lr = await fetch(localProxyAbsolute, { headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' } });
+              localProxyMeta = { status: lr.status, contentType: lr.headers.get('content-type'), acceptRanges: lr.headers.get('accept-ranges') };
+            } catch (lErr2) {
+              localProxyMeta = { error: (lErr2 && lErr2.message) || String(lErr2) };
+            }
+          }
+        } catch (le) {
+          localProxyMeta = { error: (le && le.message) || String(le) };
+        }
+
+        // Cache the resolved url and diagnostics (include local proxy info)
+        resolvedExtractedCache.set(cacheKey, { ts: Date.now(), resolvedUrl, proxiedUrl, resolvedMeta, proxiedMeta, localProxyUrl, localProxyMeta });
+
+        console.log('[ExtractResolve] Resolved URL', { resolvedUrl, proxiedUrl, resolvedMeta, proxiedMeta, localProxyUrl, localProxyMeta });
+        return res.json({ ok: true, resolvedUrl, proxiedUrl, localProxyUrl, resolvedMeta, proxiedMeta, localProxyMeta });
+      } catch (err) {
+        clearTimeout(timeoutId);
+        console.warn('[ExtractResolve] Fetch failed', err && err.message);
+        return res.status(502).json({ error: 'Failed to fetch via proxy', details: err && err.message });
+      }
     } catch (error) {
       next(error);
     }
@@ -4841,20 +5159,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
           } catch (error: any) {
             console.error('Failed to create message:', error);
 
+            // Permission or policy errors
+            if (error?.status === 403) {
+              ws.send(JSON.stringify({ type: 'error', message: error.message || 'Forbidden' }));
+              return;
+            }
+
             // Check if it's a foreign key constraint error
             if (error?.code === '23503' && error?.constraint === 'messages_forum_id_forums_id_fk') {
-              ws.send(JSON.stringify({
-                type: 'error',
-                message: 'Forum no longer exists'
-              }));
+              ws.send(JSON.stringify({ type: 'error', message: 'Forum no longer exists' }));
               return;
             }
 
             // For other errors, send a generic error
-            ws.send(JSON.stringify({
-              type: 'error',
-              message: 'Failed to send message'
-            }));
+            ws.send(JSON.stringify({ type: 'error', message: 'Failed to send message' }));
           }
         }
       } catch (error) {

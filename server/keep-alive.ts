@@ -436,6 +436,33 @@ class KeepAliveService {
           console.log('🗑️ Garbage collection triggered due to high memory usage');
         }
       }
+      // Check for Neon DB size threshold and trigger replication if needed
+      try {
+        const neonManager = await import('./neon-manager');
+        const urls = await neonManager.default.getNeonDbUrls();
+        const thresholdBytes = parseInt(process.env.NEON_DB_MAX_BYTES || String(0), 10) || 0; // 0 means disabled
+        if (thresholdBytes > 0 && urls && urls.length > 0) {
+          const primary = urls[0];
+          const size = await neonManager.getDbSizeBytes(primary);
+          if (size !== null) {
+            console.log(`[KeepAlive] Primary Neon DB size: ${size} bytes`);
+            if (size >= thresholdBytes) {
+              console.log(`[KeepAlive] Primary Neon DB reached threshold ${thresholdBytes}, triggering replication`);
+              // Run replicate in background but ensure only one at a time
+              (async () => {
+                try {
+                  await neonManager.default.tryReplicateToAnotherNeon(thresholdBytes);
+                } catch (err) {
+                  console.warn('[KeepAlive] Neon replication attempt failed', err);
+                }
+              })();
+            }
+          }
+        }
+      } catch (err) {
+        // Non-fatal - just log and continue
+        console.warn('[KeepAlive] Neon manager check failed', err?.message || err);
+      }
     } catch (error: any) {
       console.warn('⚠️ Background task failed:', error.message);
     }

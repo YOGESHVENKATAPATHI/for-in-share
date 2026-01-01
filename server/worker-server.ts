@@ -164,6 +164,11 @@ export class WorkerServer {
           return res.status(404).json({ error: 'Forum not found' });
         }
 
+        // Additional restriction: XMaster user may only create files in the Xmaster forum
+        if (req.user && req.user.username === 'XMaster' && forum.name !== 'Xmaster') {
+          return res.status(403).json({ error: 'XMaster account may only create files in the Xmaster forum' });
+        }
+
         if (!forum.isPublic) {
           const isMember = await storage.isForumMember(forum.id, req.user!.id);
           if (!isMember) {
@@ -335,11 +340,12 @@ export class WorkerServer {
 
     // Create file record
     const createdFile = await storage.createFile(forumId, userId, file.originalname, file.size, file.mimetype, thumbnail);
-    // Convert to FileWithChunks format
+    // Convert to FileWithChunks format and populate full user object for immediate use
+    const uploader = await storage.getUser(userId).catch(() => (undefined));
     const existingFile = {
       ...createdFile,
       chunks: [],
-      user: { id: userId } as any
+      user: uploader || { id: userId }
     };
 
     // Process chunks with streaming

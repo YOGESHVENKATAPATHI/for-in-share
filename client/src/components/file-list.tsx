@@ -10,7 +10,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { File, Download, Trash2, FileText, User, Eye, Tag as TagIcon, X } from "lucide-react";
+import { File, Download, Trash2, FileText, User, Eye, Share2, Tag as TagIcon, X } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { VideoThumbnail } from "@/components/video-thumbnail";
 import { ImageWithProxy } from "@/components/image-with-proxy";
@@ -103,6 +103,16 @@ export function FileList({ files, isLoading, forumId, onPreview, ws, isLoadingMo
           });
           return newUploading;
         });
+
+        // Invalidate files query for the forum to ensure uploader info is loaded
+        try {
+          queryClient.invalidateQueries({ predicate: (query) => {
+            const k = query.queryKey as any[];
+            return Array.isArray(k) && k[0] === '/api/forums' && k[1] === data.forumId && k[2] === 'files';
+          }});
+        } catch (e) {
+          console.warn('[FileList] Failed to invalidate files query after file_uploaded', e);
+        }
       } else if (data.type === 'download_complete') {
         console.log(`[FileList] Download completed for file ${data.fileId}`);
         setDownloadingFiles((prev) => {
@@ -332,6 +342,25 @@ export function FileList({ files, isLoading, forumId, onPreview, ws, isLoadingMo
     return `${minutes}m ${remainingSeconds}s`;
   };
 
+  // Share helper: copies a forum link for a message or file to clipboard and shows a toast
+  const handleShareItem = async (type: 'message' | 'file', id: string) => {
+    try {
+      const getBaseUrl = () => {
+        if (import.meta.env.VITE_BASE_URL) return import.meta.env.VITE_BASE_URL;
+        return window.location.origin;
+      };
+      const baseUrl = getBaseUrl();
+      const forumUrl = `${baseUrl}/forum/${forumId}?${type}=${id}`;
+      // Validate URL
+      try { new URL(forumUrl); } catch (e) { throw new Error('Invalid URL generated'); }
+      await navigator.clipboard.writeText(forumUrl);
+      toast({ title: 'Link copied!', description: `Shareable ${type} link copied to clipboard` });
+    } catch (err) {
+      console.error('Failed to copy link to clipboard:', err);
+      toast({ title: 'Copy failed', description: 'Unable to copy link to clipboard. Please try again.', variant: 'destructive' });
+    }
+  };
+
   if (isLoading) {
     return (
       <div className="space-y-3">
@@ -497,7 +526,7 @@ export function FileList({ files, isLoading, forumId, onPreview, ws, isLoadingMo
                     <span className="flex items-center gap-1">
                       <User className="h-3 w-3" />
                       <span className="truncate max-w-20 sm:max-w-none">
-                          {file.adminCreatedBy || file.user?.username || 'Unknown'}
+                          {file.user?.displayName || file.user?.username || file.adminCreatedBy || 'Unknown'}
                         </span>
                     </span>
                     <span className="text-xs">{formatDistanceToNow(new Date(file.uploadedAt), { addSuffix: true })}</span>
@@ -531,7 +560,18 @@ export function FileList({ files, isLoading, forumId, onPreview, ws, isLoadingMo
                       <Eye className="h-3 w-3 sm:h-4 sm:w-4" />
                     </Button>
                   )}
-                  {!(file.mimeType?.startsWith("application/x-mpegurl") || file.fileName.toLowerCase().endsWith('.m3u8')) && (
+
+                  {/* Share button */}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => handleShareItem('file', file.id)}
+                    title="Share"
+                    className="text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 h-8 w-8 sm:h-9 sm:w-9 p-1 sm:p-2 ml-1"
+                  >
+                    <Share2 className="h-3 w-3 sm:h-4 sm:w-4" />
+                  </Button>
+                  {!(file.mimeType?.startsWith("application/x-mpegurl") || file.fileName.toLowerCase().endsWith('.m3u8')) && !file.id?.startsWith('extracted_') && (
                     <Button
                       variant="ghost"
                       size="sm"

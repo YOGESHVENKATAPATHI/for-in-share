@@ -144,6 +144,8 @@ export function registerStreamingUploadRoutes(
       });
 
       // Broadcast file upload completion to all clients in the forum
+      // Include uploader details so clients immediately show correct name
+      const uploader = await storage.getUser(req.user!.id);
       clients.forEach((client) => {
         if (client.ws.readyState === WebSocket.OPEN && client.forumId === forumId) {
           client.ws.send(JSON.stringify({
@@ -154,6 +156,8 @@ export function registerStreamingUploadRoutes(
               originalName: fileName,
               size: result.totalSize,
               uploadedBy: req.user!.id,
+              uploadedByName: uploader?.displayName || uploader?.username || null,
+              uploader,
               forumId: forumId,
               checksum: result.checksum
             }

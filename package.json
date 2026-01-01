@@ -28,7 +28,9 @@
     "render:config:staging": "node scripts/generate-render-config.mjs staging",
     "worker:config": "node scripts/worker-url-helper.mjs",
     "worker:test": "node scripts/worker-url-helper.mjs test",
-    "extract-urls": "node scripts/extract-urls.mjs"
+    "extract-urls": "node scripts/extract-urls.mjs",
+    "update-metadata": "node scripts/automate-metadata-update.mjs"
+    ,"import:neon:backup": "npx tsx scripts/import-neon-backup.mjs"
   },
   "dependencies": {
     "@ffmpeg-installer/ffmpeg": "^1.1.0",

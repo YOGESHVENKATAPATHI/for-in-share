@@ -160,10 +160,10 @@ export function FilePreviewDialog({ file, open, onClose, onDownload }: FilePrevi
                   <span>•</span>
                 </>
               )}
-              <span>Uploaded by {file.user?.username || file.adminCreatedBy || 'Unknown'}</span>
+              <span>Uploaded by {file.user?.displayName || file.user?.username || file.adminCreatedBy || 'Unknown'}</span>
             </div>
             <div className="flex items-center gap-2">
-              {!(file.mimeType?.startsWith("application/x-mpegurl") || file.fileName.toLowerCase().endsWith('.m3u8')) && (
+              {!(file.mimeType?.startsWith("application/x-mpegurl") || file.fileName.toLowerCase().endsWith('.m3u8')) && !file.id?.startsWith('extracted_') && (
                 <Button
                   variant="outline"
                   size="sm"
@@ -231,10 +231,12 @@ export function FilePreviewDialog({ file, open, onClose, onDownload }: FilePrevi
                     <div className="text-center p-8">
                       <AlertCircle className="h-12 w-12 text-destructive mx-auto mb-4" />
                       <p className="text-sm text-muted-foreground mb-4">Failed to load PDF</p>
-                      <Button variant="outline" onClick={() => onDownload(file.id)}>
-                        <Download className="h-4 w-4 mr-2" />
-                        Download File
-                      </Button>
+                      {!file.id?.startsWith('extracted_') && (
+                        <Button variant="outline" onClick={() => onDownload(file.id)}>
+                          <Download className="h-4 w-4 mr-2" />
+                          Download File
+                        </Button>
+                      )}
                     </div>
                   }
                 >
@@ -277,10 +279,12 @@ export function FilePreviewDialog({ file, open, onClose, onDownload }: FilePrevi
               <p className="text-sm text-muted-foreground mb-4">
                 Download to view the contents of this file
               </p>
-              <Button onClick={() => onDownload(file.id)}>
-                <Download className="h-4 w-4 mr-2" />
-                Download to View
-              </Button>
+              {!file.id?.startsWith('extracted_') && (
+                <Button onClick={() => onDownload(file.id)}>
+                  <Download className="h-4 w-4 mr-2" />
+                  Download to View
+                </Button>
+              )}
             </div>
           ) : isVideo ? (
             <div className="w-full h-full">

@@ -102,8 +102,6 @@ export default function ForumPage() {
   const [viewMode, setViewMode] = useState<"timeline" | "files">("timeline");
   const [previewFile, setPreviewFile] = useState<FileWithChunks | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
-  // Timeout ref used to defer clearing deep-link params so UI can render/scroll
-  const deepLinkClearTimeoutRef = useRef<number | null>(null);
   const [editingForumTags, setEditingForumTags] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
@@ -541,67 +539,84 @@ export default function ForumPage() {
 
   // Include specific file and related files when file parameter is present
   useEffect(() => {
-    if (scrollToFile && specificFile && relatedFiles) {
-      const combinedFiles = [specificFile, ...relatedFiles];
-      // Remove duplicates
-      const existingIds = new Set(allFiles.map(f => f.id));
-      const newFiles = combinedFiles.filter(f => !existingIds.has(f.id));
-      if (newFiles.length > 0) {
-        setAllFiles(prev => [...prev, ...newFiles]);
+    if (scrollToFile && specificFile) {
+      // Ensure specific file is in allFiles
+      setAllFiles(prev => {
+        if (prev.find(f => f.id === specificFile.id)) return prev;
+        return [specificFile, ...prev];
+      });
+
+      // Ensure specific file is in searchFiles (if needed)
+      setSearchFiles(prev => {
+        if (prev.find(f => f.id === specificFile.id)) return prev;
+        return [specificFile, ...prev];
+      });
+
+      if (relatedFiles) {
+        const combinedFiles = [specificFile, ...relatedFiles];
+        // Remove duplicates
+        const existingIds = new Set(allFiles.map(f => f.id));
+        const newFiles = combinedFiles.filter(f => !existingIds.has(f.id));
+        if (newFiles.length > 0) {
+          setAllFiles(prev => [...prev, ...newFiles]);
+        }
       }
+
+      // Try to scroll to and highlight the specific file element. Retry for up to 1 minute.
+      const targetId = `file-${specificFile.id}`;
+      let attempts = 0;
+      const intervalMs = 500; // check twice a second
+      const maxAttempts = Math.ceil(60000 / intervalMs); // 1 minute worth of attempts
+
+      const clearUrlParams = () => {
+        try {
+          const url = new URL(window.location.href);
+          if (url.searchParams.has('file')) {
+            url.searchParams.delete('file');
+            url.searchParams.delete('message');
+            window.history.replaceState({}, '', url.pathname + url.search + url.hash);
+          }
+        } catch (e) {
+          console.warn('Failed to clear deep link params', e);
+        }
+      };
+
+      const timer = setInterval(() => {
+        attempts += 1;
+        const el = document.getElementById(targetId);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          el.classList.add('ring-2', 'ring-primary', 'ring-opacity-50');
+          setTimeout(() => {
+            el.classList.remove('ring-2', 'ring-primary', 'ring-opacity-50');
+          }, 3000);
+          // Found it — stop retrying and clear fallback timeout
+          clearInterval(timer);
+          if (fallbackTimeout) clearTimeout(fallbackTimeout);
+          
+          // Clear URL params on success
+          clearUrlParams();
+        } else if (attempts >= maxAttempts) {
+          // Stop retrying — fallback will run shortly via fallbackTimeout
+          clearInterval(timer);
+        }
+      }, intervalMs);
+
+      // After 1 minute, if we still haven't found the element, remove the `file` param from the URL
+      // and notify the user. This prevents stale shared links from persisting forever.
+      const fallbackTimeout = setTimeout(() => {
+        clearUrlParams();
+        // Notify the user that the deep-link was cleared
+        try { toast({ title: 'Link cleared', description: 'The requested file could not be found; the shared link was cleared.', variant: 'default' }); } catch (e) { console.warn('Toast failed', e); }
+      }, 60000);
+
+      // Clean up timers if effect re-runs
+      return () => {
+        clearInterval(timer);
+        clearTimeout(fallbackTimeout);
+      };
     }
   }, [scrollToFile, specificFile, relatedFiles, allFiles]);
-
-  // If a specific file was requested via URL (scrollToFile), ensure it's present
-  // in the search results and allFiles so UnifiedTimeline / FileList can render it.
-  // Also open the preview automatically so shareable links load the target file.
-  useEffect(() => {
-    if (!scrollToFile || !specificFile) return;
-
-    // Add to searchFiles if not already present (so search view will include it)
-    setSearchFiles(prev => {
-      if (prev.find(f => f.id === specificFile.id)) return prev;
-      return [specificFile, ...prev];
-    });
-
-    // Also add to allFiles (files list, timeline view fallback)
-    setAllFiles(prev => {
-      if (prev.find(f => f.id === specificFile.id)) return prev;
-      return [specificFile, ...prev];
-    });
-
-    // Ensure timeline view is active so the element exists and can be scrolled
-    setViewMode('timeline');
-
-    // Open preview only after UnifiedTimeline confirms it handled the deep link
-    // Add a one-time listener and a fallback timeout
-    let handled = false;
-    const onHandled = (ev: any) => {
-      if (ev?.detail?.type === 'file' && String(ev.detail.id) === String(scrollToFile)) {
-        handled = true;
-        setPreviewFile(specificFile);
-        setPreviewOpen(true);
-      }
-    };
-
-    window.addEventListener('deep-link-handled', onHandled);
-
-    // Fallback: if UnifiedTimeline didn't report handled within 2s, open preview anyway
-    const fallbackTimer = window.setTimeout(() => {
-      if (!handled) {
-        setPreviewFile(specificFile);
-        setPreviewOpen(true);
-      }
-      window.removeEventListener('deep-link-handled', onHandled);
-    }, 2000);
-    // Cleanup listeners/timers when scrollToFile or specificFile change
-    return () => {
-      try {
-        window.removeEventListener('deep-link-handled', onHandled);
-        window.clearTimeout(fallbackTimer);
-      } catch (e) {}
-    };
-  }, [scrollToFile, specificFile]);
 
   const loadMoreFiles = async () => {
     setFilesOffset(prev => prev + filesLimit);
@@ -811,7 +826,6 @@ export default function ForumPage() {
     return () => window.removeEventListener('popstate', onPop);
   }, []);
 
-  // No deep-link timer cleanup required (UnifiedTimeline handles clearing). Keep existing forumId cleanup
   useEffect(() => {
     if (!forumId) {
       setShowPeoplePanel(false);

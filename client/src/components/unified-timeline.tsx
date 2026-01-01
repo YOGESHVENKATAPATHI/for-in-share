@@ -1028,62 +1028,35 @@ export function UnifiedTimeline({ messages, files, forumId, scrollToMessage, scr
     timelineEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [timelineItems.length]);
 
-  // Auto-scroll to specific message or file when URL parameters are present
+  // Auto-scroll to specific message when URL parameters are present
+  // Note: File scrolling is handled globally in forum-page.tsx to support async loading of specific files
   useEffect(() => {
-    if (scrollToMessage || scrollToFile) {
-      const targetId = scrollToMessage ? `message-${scrollToMessage}` : `file-${scrollToFile}`;
-      let aborted = false;
-      const timeouts: number[] = [];
-
-      const tryScroll = (attempt = 0) => {
-        if (aborted) return;
+    if (scrollToMessage) {
+      // Small delay to ensure DOM is fully rendered
+      const timer = setTimeout(() => {
+        const targetId = `message-${scrollToMessage}`;
         const element = document.getElementById(targetId);
         if (element) {
-          element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          element.classList.add('ring-2', 'ring-primary', 'ring-opacity-50');
+          element.scrollIntoView({ behavior: "smooth", block: "center" });
+          // Add a highlight effect
+          element.classList.add("ring-2", "ring-primary", "ring-opacity-50");
           setTimeout(() => {
-            element.classList.remove('ring-2', 'ring-primary', 'ring-opacity-50');
+            element.classList.remove("ring-2", "ring-primary", "ring-opacity-50");
           }, 3000);
-
-          // Clear the deep-link query params now that the file/message is visible
-          try {
-            const url = new URL(window.location.href);
-            url.searchParams.delete('file');
-            url.searchParams.delete('message');
-            window.history.replaceState({}, '', url.pathname + url.search + url.hash);
-          } catch (e) {
-            console.warn('Failed to clear deep link params in UnifiedTimeline', e);
-          }
-
-          // Emit a global event so parent pages can react if needed
-          try {
-            const detail = { type: scrollToMessage ? 'message' : 'file', id: scrollToMessage || scrollToFile };
-            window.dispatchEvent(new CustomEvent('deep-link-handled', { detail } as any));
-          } catch (e) {
-            // ignore
-          }
-
-          return;
         }
 
-        // Retry a few times to wait for DOM to render
-        if (attempt < 7) {
-          const t = window.setTimeout(() => tryScroll(attempt + 1), 200);
-          timeouts.push(t as any);
-        } else {
-          // Give up after several attempts
-          console.warn(`[UnifiedTimeline] Could not find target element ${targetId} after multiple attempts`);
+        // Clear the deep-link query params so reloading won't re-trigger the scroll
+        try {
+          const url = new URL(window.location.href);
+          url.searchParams.delete('message');
+          window.history.replaceState({}, '', url.pathname + url.search + url.hash);
+        } catch (e) {
+          console.warn('Failed to clear deep link params in UnifiedTimeline', e);
         }
-      };
-
-      tryScroll();
-
-      return () => {
-        aborted = true;
-        for (const t of timeouts) window.clearTimeout(t as any);
-      };
+      }, 500);
+      return () => clearTimeout(timer);
     }
-  }, [timelineItems.length, scrollToMessage, scrollToFile]);
+  }, [timelineItems.length, scrollToMessage]);
 
   if (timelineItems.length === 0) {
     return (

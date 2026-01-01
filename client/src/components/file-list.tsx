@@ -429,7 +429,7 @@ export function FileList({ files, isLoading, forumId, onPreview, ws, isLoadingMo
 
         return (
           <>
-            <Card key={file.id} className="border-zinc-800 bg-zinc-900 rounded-none hover:bg-zinc-800 transition-colors" data-testid={`file-${file.id}`}>
+            <Card key={file.id} id={`file-${file.id}`} className="border-zinc-800 bg-zinc-900 rounded-none hover:bg-zinc-800 transition-colors" data-testid={`file-${file.id}`}>
             <CardContent className="p-3 sm:p-4">
               <div className="flex items-start gap-2 sm:gap-3">
                 {file.adminThumbnailUrl ? (

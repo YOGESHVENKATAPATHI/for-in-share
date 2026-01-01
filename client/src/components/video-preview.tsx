@@ -102,6 +102,16 @@ export function VideoPreview({
     // Reset resolved proxied URL for extracted files
     setResolvedProxiedUrl(null);
     setResolvingExtracted(false);
+
+    // If the file came pre-resolved by the opener (shared link), use that immediately
+    const preResolved = (file as any).clientResolvedUrl;
+    if (preResolved) {
+      console.log('[VideoPreview] Using pre-resolved client URL from opener:', preResolved);
+      setResolvedProxiedUrl(preResolved);
+      setResolvedLocalProxyUrl((file as any).clientResolvedLocalUrl || null);
+      setResolvedMeta((file as any).clientResolvedMeta || null);
+      appliedSrcRef.current = preResolved;
+    }
   }, [file.id, file.fileName]);
 
   // For extracted files (Xmaster), resolve live mp4/m3u8 via server which uses the Vercel proxy
@@ -110,6 +120,7 @@ export function VideoPreview({
     async function resolveExtracted() {
       if (!file.id.startsWith('extracted_')) return;
       if (!file.directDownloadUrl && !(file as any).videoUrl) return;
+      console.log('[VideoPreview] resolveExtracted starting for', file.id);
       // Client-side TTL guard to avoid rapid repeated resolve calls
       if (Date.now() - lastResolveAtRef.current < RESOLVE_TTL_MS) {
         console.log('[VideoPreview] Skipping resolve (cached recently)');

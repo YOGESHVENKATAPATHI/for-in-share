@@ -20,7 +20,7 @@ import http from 'http';
 import KeepAliveService from './keep-alive.mjs';
 
 // Neon DB connection string
-const connectionString = 'postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
+const connectionString = '';
 
 const proxyUrl = 'https://webproxier-ov6et6gpw-ogeshs-projects.vercel.app/api/proxy?url=';
 

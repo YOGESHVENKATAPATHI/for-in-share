@@ -1,4 +1,4 @@
-import { Request, Response } from 'express';
+import type { Request, Response } from 'express';
 import { app, initApp } from '../server/index';
 
 export default async function handler(req: Request, res: Response) {

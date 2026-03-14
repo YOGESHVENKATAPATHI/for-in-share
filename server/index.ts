@@ -103,7 +103,13 @@ app.use((req, res, next) => {
   next();
 });
 
-(async () => {
+export { app };
+let isInitialized = false;
+
+export const initApp = async () => {
+  if (isInitialized) return;
+  isInitialized = true;
+
   const server = await registerRoutes(app);
 
   app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
@@ -169,51 +175,53 @@ app.use((req, res, next) => {
     next();
   }, express.static(path.join(__dirname, 'storage/hls')));
 
-  server.listen({
-    port,
-    host: "0.0.0.0", // Changed from "localhost" to "0.0.0.0" for Render
-  }, () => {
-    log(`🚀 Server running on port ${port}`);
-    
-    // Start keep-alive service for Render-like persistent deployments.
-    // Vercel serverless does not support long-running keep-alive loops.
-    const keepAliveEnabled = process.env.KEEP_ALIVE_ENABLED === 'true' || 
-                           (process.env.KEEP_ALIVE_ENABLED !== 'false' && 
-                            (process.env.NODE_ENV === 'production' || process.env.RENDER_EXTERNAL_URL));
-    
-    if (keepAliveEnabled && !isVercelRuntime) {
-      // Start keep-alive service after longer delay to ensure server is stable
-      setTimeout(() => {
-        keepAliveService.start(port);
-      }, 15000); // Start after 15 seconds to let server fully stabilize
-      log(`🔄 Keep-alive service will start with self-ping on port ${port}`);
-    } else if (isVercelRuntime) {
-      log('🔄 Keep-alive service disabled for Vercel runtime');
-    } else {
-      log('🔄 Keep-alive service disabled');
-    }
-    
-    if (process.env.NODE_ENV === 'development') {
-      log(`📊 Memory monitoring active (limit: ${memoryOptimizer.getMemoryStats().limit}MB)`);
+  if (!isVercelRuntime) {
+    server.listen({
+      port,
+      host: "0.0.0.0", // Changed from "localhost" to "0.0.0.0" for Render
+    }, () => {
+      log(`🚀 Server running on port ${port}`);
       
-      // Log cluster information in development
-      const clusterMetrics = clusterManager.getClusterMetrics();
-      if (clusterMetrics.totalServers > 0) {
-        log(`🌐 Cluster: ${clusterMetrics.healthyServers}/${clusterMetrics.totalServers} workers healthy`);
+      // Start keep-alive service for Render-like persistent deployments.
+      // Vercel serverless does not support long-running keep-alive loops.
+      const keepAliveEnabled = process.env.KEEP_ALIVE_ENABLED === 'true' || 
+                             (process.env.KEEP_ALIVE_ENABLED !== 'false' && 
+                              (process.env.NODE_ENV === 'production' || process.env.RENDER_EXTERNAL_URL));
+      
+      if (keepAliveEnabled && !isVercelRuntime) {
+        // Start keep-alive service after longer delay to ensure server is stable
+        setTimeout(() => {
+          keepAliveService.start(port);
+        }, 15000); // Start after 15 seconds to let server fully stabilize
+        log(`🔄 Keep-alive service will start with self-ping on port ${port}`);
+      } else if (isVercelRuntime) {
+        log('🔄 Keep-alive service disabled for Vercel runtime');
+      } else {
+        log('🔄 Keep-alive service disabled');
       }
-    }
-  });
+      
+      if (process.env.NODE_ENV === 'development') {
+        log(`📊 Memory monitoring active (limit: ${memoryOptimizer.getMemoryStats().limit}MB)`);
+        
+        // Log cluster information in development
+        const clusterMetrics = clusterManager.getClusterMetrics();
+        if (clusterMetrics.totalServers > 0) {
+          log(`🌐 Cluster: ${clusterMetrics.healthyServers}/${clusterMetrics.totalServers} workers healthy`);
+        }
+      }
+    });
 
-  // Graceful shutdown handling
-  process.on('SIGTERM', async () => {
-    console.log('🔌 Received SIGTERM, shutting down gracefully...');
-    await gracefulShutdown();
-  });
+    // Graceful shutdown handling
+    process.on('SIGTERM', async () => {
+      console.log('🔌 Received SIGTERM, shutting down gracefully...');
+      await gracefulShutdown();
+    });
 
-  process.on('SIGINT', async () => {
-    console.log('🔌 Received SIGINT, shutting down gracefully...');
-    await gracefulShutdown();
-  });
+    process.on('SIGINT', async () => {
+      console.log('🔌 Received SIGINT, shutting down gracefully...');
+      await gracefulShutdown();
+    });
+  }
 
   async function gracefulShutdown() {
     try {
@@ -238,4 +246,8 @@ app.use((req, res, next) => {
       process.exit(1);
     }
   }
-})();
+};
+
+if (!isVercelRuntime) {
+  initApp().catch(console.error);
+}

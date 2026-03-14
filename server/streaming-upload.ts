@@ -4,6 +4,7 @@ import { createHash } from "crypto";
 import { createReadStream, createWriteStream, unlink } from "fs";
 import { pipeline } from "stream/promises";
 import path from "path";
+import os from "os";
 import sharp from 'sharp';
 import ffmpeg from 'fluent-ffmpeg';
 import { path as ffmpegPath } from '@ffmpeg-installer/ffmpeg';

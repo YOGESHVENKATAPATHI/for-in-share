@@ -105,14 +105,16 @@ app.use((req, res, next) => {
 
 export { app };
 let isInitialized = false;
+let initPromise: Promise<void> | null = null;
 
 export const initApp = async () => {
   if (isInitialized) return;
-  isInitialized = true;
+  if (initPromise) return initPromise;
 
-  const server = await registerRoutes(app);
+  initPromise = (async () => {
+    const server = await registerRoutes(app);
 
-  app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
+    app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
     const message = err.message || "Internal Server Error";
 
@@ -137,114 +139,126 @@ export const initApp = async () => {
       errorType: err.constructor.name
     });
 
-    res.status(status).json({ message });
-  });
+      res.status(status).json({ message });
+    });
 
   // importantly only setup vite in development and after
   // setting up all the other routes so the catch-all route
   // doesn't interfere with the other routes
-  if (app.get("env") === "development") {
-    await setupVite(app, server);
-  } else {
-    serveStatic(app);
-  }
+    if (app.get("env") === "development") {
+      await setupVite(app, server);
+    } else {
+      serveStatic(app);
+    }
 
   // Use dynamic port assignment for development or environment port for production
-  let port: number;
+    let port: number;
   
-  if (process.env.NODE_ENV === 'production' && process.env.PORT) {
-    port = parseInt(process.env.PORT, 10);
-  } else {
-    // Dynamic port assignment for development
-    const preferredPort = parseInt(process.env.PORT || '5000', 10);
-    port = await portManager.assignPort('main', preferredPort);
-  }
+    if (process.env.NODE_ENV === 'production' && process.env.PORT) {
+      port = parseInt(process.env.PORT, 10);
+    } else {
+      // Dynamic port assignment for development
+      const preferredPort = parseInt(process.env.PORT || '5000', 10);
+      port = await portManager.assignPort('main', preferredPort);
+    }
 
   // Add cluster management middleware if workers are configured.
   // Skip this in Vercel serverless runtime.
-  const hasWorkers = process.env.WORKER_SERVERS || process.env.UPLOAD_WORKERS || process.env.CHAT_WORKERS;
-  if (hasWorkers && !isVercelRuntime) {
-    app.use('/api', loadBalancer.getLoadBalanceMiddleware());
-    log('🌐 Load balancer enabled for worker servers');
-  }
+    const hasWorkers = process.env.WORKER_SERVERS || process.env.UPLOAD_WORKERS || process.env.CHAT_WORKERS;
+    if (hasWorkers && !isVercelRuntime) {
+      app.use('/api', loadBalancer.getLoadBalanceMiddleware());
+      log('🌐 Load balancer enabled for worker servers');
+    }
 
   // Serve HLS files with CORS headers
-  app.use('/hls', (req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET');
-    next();
-  }, express.static(path.join(__dirname, 'storage/hls')));
+    app.use('/hls', (req, res, next) => {
+      res.header('Access-Control-Allow-Origin', '*');
+      res.header('Access-Control-Allow-Methods', 'GET');
+      next();
+    }, express.static(path.join(__dirname, 'storage/hls')));
 
-  if (!isVercelRuntime) {
-    server.listen({
-      port,
-      host: "0.0.0.0", // Changed from "localhost" to "0.0.0.0" for Render
-    }, () => {
-      log(`🚀 Server running on port ${port}`);
+    if (!isVercelRuntime) {
+      server.listen({
+        port,
+        host: "0.0.0.0", // Changed from "localhost" to "0.0.0.0" for Render
+      }, () => {
+        log(`🚀 Server running on port ${port}`);
       
       // Start keep-alive service for Render-like persistent deployments.
       // Vercel serverless does not support long-running keep-alive loops.
-      const keepAliveEnabled = process.env.KEEP_ALIVE_ENABLED === 'true' || 
-                             (process.env.KEEP_ALIVE_ENABLED !== 'false' && 
-                              (process.env.NODE_ENV === 'production' || process.env.RENDER_EXTERNAL_URL));
+        const keepAliveEnabled = process.env.KEEP_ALIVE_ENABLED === 'true' || 
+                   (process.env.KEEP_ALIVE_ENABLED !== 'false' && 
+              (process.env.NODE_ENV === 'production' || process.env.RENDER_EXTERNAL_URL));
       
-      if (keepAliveEnabled && !isVercelRuntime) {
-        // Start keep-alive service after longer delay to ensure server is stable
-        setTimeout(() => {
-          keepAliveService.start(port);
-        }, 15000); // Start after 15 seconds to let server fully stabilize
-        log(`🔄 Keep-alive service will start with self-ping on port ${port}`);
-      } else if (isVercelRuntime) {
-        log('🔄 Keep-alive service disabled for Vercel runtime');
-      } else {
-        log('🔄 Keep-alive service disabled');
-      }
+        if (keepAliveEnabled && !isVercelRuntime) {
+          // Start keep-alive service after longer delay to ensure server is stable
+          setTimeout(() => {
+            keepAliveService.start(port);
+          }, 15000); // Start after 15 seconds to let server fully stabilize
+          log(`🔄 Keep-alive service will start with self-ping on port ${port}`);
+        } else if (isVercelRuntime) {
+          log('🔄 Keep-alive service disabled for Vercel runtime');
+        } else {
+          log('🔄 Keep-alive service disabled');
+        }
       
-      if (process.env.NODE_ENV === 'development') {
-        log(`📊 Memory monitoring active (limit: ${memoryOptimizer.getMemoryStats().limit}MB)`);
+        if (process.env.NODE_ENV === 'development') {
+          log(`📊 Memory monitoring active (limit: ${memoryOptimizer.getMemoryStats().limit}MB)`);
         
         // Log cluster information in development
-        const clusterMetrics = clusterManager.getClusterMetrics();
-        if (clusterMetrics.totalServers > 0) {
-          log(`🌐 Cluster: ${clusterMetrics.healthyServers}/${clusterMetrics.totalServers} workers healthy`);
+          const clusterMetrics = clusterManager.getClusterMetrics();
+          if (clusterMetrics.totalServers > 0) {
+            log(`🌐 Cluster: ${clusterMetrics.healthyServers}/${clusterMetrics.totalServers} workers healthy`);
+          }
         }
-      }
-    });
-
-    // Graceful shutdown handling
-    process.on('SIGTERM', async () => {
-      console.log('🔌 Received SIGTERM, shutting down gracefully...');
-      await gracefulShutdown();
-    });
-
-    process.on('SIGINT', async () => {
-      console.log('🔌 Received SIGINT, shutting down gracefully...');
-      await gracefulShutdown();
-    });
-  }
-
-  async function gracefulShutdown() {
-    try {
-      // Close server
-      server.close(() => {
-        console.log('✅ HTTP server closed');
       });
 
-      // Shutdown components
-      if (!isVercelRuntime) {
-        keepAliveService.stop();
-        loadBalancer.shutdown();
-        clusterManager.shutdown();
-        memoryOptimizer.shutdown();
-        portManager.shutdown();
-      }
+      // Graceful shutdown handling
+      process.on('SIGTERM', async () => {
+        console.log('🔌 Received SIGTERM, shutting down gracefully...');
+        await gracefulShutdown();
+      });
 
-      console.log('✅ Graceful shutdown complete');
-      process.exit(0);
-    } catch (error) {
-      console.error('❌ Error during shutdown:', error);
-      process.exit(1);
+      process.on('SIGINT', async () => {
+        console.log('🔌 Received SIGINT, shutting down gracefully...');
+        await gracefulShutdown();
+      });
     }
+
+    async function gracefulShutdown() {
+      try {
+        // Close server
+        server.close(() => {
+          console.log('✅ HTTP server closed');
+        });
+
+        // Shutdown components
+        if (!isVercelRuntime) {
+          keepAliveService.stop();
+          loadBalancer.shutdown();
+          clusterManager.shutdown();
+          memoryOptimizer.shutdown();
+          portManager.shutdown();
+        }
+
+        console.log('✅ Graceful shutdown complete');
+        process.exit(0);
+      } catch (error) {
+        console.error('❌ Error during shutdown:', error);
+        process.exit(1);
+      }
+    }
+
+    isInitialized = true;
+  })();
+
+  try {
+    await initPromise;
+  } catch (error) {
+    // Allow retries on later invocations if startup fails once.
+    isInitialized = false;
+    initPromise = null;
+    throw error;
   }
 };
 

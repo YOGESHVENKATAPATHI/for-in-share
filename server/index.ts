@@ -17,19 +17,22 @@ import { loadBalancer } from "./load-balancer";
 import { keepAliveService } from "./keep-alive";
 
 const app = express();
+const isVercelRuntime = process.env.VERCEL === '1' || process.env.VERCEL === 'true';
 
 // Initialize memory optimization with keep-alive integration
-memoryOptimizer.on('memoryExhaustion', (data) => {
-  console.error('🚨 Memory exhaustion detected:', data);
-  // Emergency pause keep-alive service to reduce memory pressure
-  keepAliveService.emergencyPause(120000); // 2 minutes pause
-});
+if (!isVercelRuntime) {
+  memoryOptimizer.on('memoryExhaustion', (data) => {
+    console.error('🚨 Memory exhaustion detected:', data);
+    // Emergency pause keep-alive service to reduce memory pressure
+    keepAliveService.emergencyPause(120000); // 2 minutes pause
+  });
 
-memoryOptimizer.on('memoryWarning', (data) => {
-  console.warn('⚠️ Memory warning:', data);
-  // Temporary pause keep-alive during memory warnings
-  keepAliveService.emergencyPause(60000); // 1 minute pause
-});
+  memoryOptimizer.on('memoryWarning', (data) => {
+    console.warn('⚠️ Memory warning:', data);
+    // Temporary pause keep-alive during memory warnings
+    keepAliveService.emergencyPause(60000); // 1 minute pause
+  });
+}
 
 declare module 'http' {
   interface IncomingMessage {
@@ -151,9 +154,10 @@ app.use((req, res, next) => {
     port = await portManager.assignPort('main', preferredPort);
   }
 
-  // Add cluster management middleware if workers are configured
+  // Add cluster management middleware if workers are configured.
+  // Skip this in Vercel serverless runtime.
   const hasWorkers = process.env.WORKER_SERVERS || process.env.UPLOAD_WORKERS || process.env.CHAT_WORKERS;
-  if (hasWorkers) {
+  if (hasWorkers && !isVercelRuntime) {
     app.use('/api', loadBalancer.getLoadBalanceMiddleware());
     log('🌐 Load balancer enabled for worker servers');
   }
@@ -171,17 +175,20 @@ app.use((req, res, next) => {
   }, () => {
     log(`🚀 Server running on port ${port}`);
     
-    // Start keep-alive service for Render deployment
+    // Start keep-alive service for Render-like persistent deployments.
+    // Vercel serverless does not support long-running keep-alive loops.
     const keepAliveEnabled = process.env.KEEP_ALIVE_ENABLED === 'true' || 
                            (process.env.KEEP_ALIVE_ENABLED !== 'false' && 
                             (process.env.NODE_ENV === 'production' || process.env.RENDER_EXTERNAL_URL));
     
-    if (keepAliveEnabled) {
+    if (keepAliveEnabled && !isVercelRuntime) {
       // Start keep-alive service after longer delay to ensure server is stable
       setTimeout(() => {
         keepAliveService.start(port);
       }, 15000); // Start after 15 seconds to let server fully stabilize
       log(`🔄 Keep-alive service will start with self-ping on port ${port}`);
+    } else if (isVercelRuntime) {
+      log('🔄 Keep-alive service disabled for Vercel runtime');
     } else {
       log('🔄 Keep-alive service disabled');
     }
@@ -216,11 +223,13 @@ app.use((req, res, next) => {
       });
 
       // Shutdown components
-      keepAliveService.stop();
-      loadBalancer.shutdown();
-      clusterManager.shutdown();
-      memoryOptimizer.shutdown();
-      portManager.shutdown();
+      if (!isVercelRuntime) {
+        keepAliveService.stop();
+        loadBalancer.shutdown();
+        clusterManager.shutdown();
+        memoryOptimizer.shutdown();
+        portManager.shutdown();
+      }
 
       console.log('✅ Graceful shutdown complete');
       process.exit(0);

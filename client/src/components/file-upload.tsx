@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Card, CardContent } from "@/components/ui/card";
 import { Upload, File, X, Check, Play, RotateCcw } from "lucide-react";
+import { apiUrl } from "@/lib/runtime-config";
 
 interface FileUploadProps {
   forumId: string;
@@ -44,6 +45,116 @@ export function FileUpload({ forumId, onUploadComplete, uploadProgress, onUpload
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
 
+  const generateImageThumbnail = async (file: File): Promise<string | null> => {
+    return new Promise((resolve) => {
+      const objectUrl = URL.createObjectURL(file);
+      const image = new Image();
+
+      image.onload = () => {
+        try {
+          const maxSize = 300;
+          const scale = Math.min(maxSize / image.width, maxSize / image.height, 1);
+          const width = Math.max(1, Math.round(image.width * scale));
+          const height = Math.max(1, Math.round(image.height * scale));
+          const canvas = document.createElement("canvas");
+
+          canvas.width = width;
+          canvas.height = height;
+
+          const context = canvas.getContext("2d");
+          if (!context) {
+            resolve(null);
+            return;
+          }
+
+          context.drawImage(image, 0, 0, width, height);
+          resolve(canvas.toDataURL("image/jpeg", 0.8));
+        } catch {
+          resolve(null);
+        } finally {
+          URL.revokeObjectURL(objectUrl);
+        }
+      };
+
+      image.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        resolve(null);
+      };
+
+      image.src = objectUrl;
+    });
+  };
+
+  const generateVideoThumbnail = async (file: File): Promise<string | null> => {
+    return new Promise((resolve) => {
+      const objectUrl = URL.createObjectURL(file);
+      const video = document.createElement("video");
+      video.preload = "metadata";
+      video.muted = true;
+      video.playsInline = true;
+
+      const cleanup = () => {
+        URL.revokeObjectURL(objectUrl);
+        video.removeAttribute("src");
+        video.load();
+      };
+
+      video.onloadedmetadata = () => {
+        const targetTime = Number.isFinite(video.duration) && video.duration > 1
+          ? Math.min(video.duration * 0.1, Math.max(video.duration - 0.1, 0))
+          : 0;
+        video.currentTime = targetTime;
+      };
+
+      video.onseeked = () => {
+        try {
+          const maxSize = 300;
+          const sourceWidth = video.videoWidth || 300;
+          const sourceHeight = video.videoHeight || 300;
+          const scale = Math.min(maxSize / sourceWidth, maxSize / sourceHeight, 1);
+          const width = Math.max(1, Math.round(sourceWidth * scale));
+          const height = Math.max(1, Math.round(sourceHeight * scale));
+
+          const canvas = document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+
+          const context = canvas.getContext("2d");
+          if (!context) {
+            resolve(null);
+            return;
+          }
+
+          context.drawImage(video, 0, 0, width, height);
+          resolve(canvas.toDataURL("image/jpeg", 0.8));
+        } catch {
+          resolve(null);
+        } finally {
+          cleanup();
+        }
+      };
+
+      video.onerror = () => {
+        cleanup();
+        resolve(null);
+      };
+
+      video.src = objectUrl;
+    });
+  };
+
+  const generateThumbnail = async (file: File): Promise<string | null> => {
+    if (file.type.startsWith("image/")) {
+      return generateImageThumbnail(file);
+    }
+
+    if (file.type.startsWith("video/")) {
+      return generateVideoThumbnail(file);
+    }
+
+    return null;
+  };
+
   // Handle pasted files
   useEffect(() => {
     if (pastedFile) {
@@ -78,7 +189,7 @@ export function FileUpload({ forumId, onUploadComplete, uploadProgress, onUpload
       formData.append("forumId", forumId);
       formData.append("checksum", checksum);
 
-      const response = await fetch("/api/files/upload", {
+      const response = await fetch(apiUrl("/api/files/upload"), {
         method: "POST",
         body: formData,
       });
@@ -105,13 +216,16 @@ export function FileUpload({ forumId, onUploadComplete, uploadProgress, onUpload
   });
 
   const uploadMutation = useMutation({
-    mutationFn: async ({ file, checksum, resumeUploadId }: { file: File; checksum: string; resumeUploadId?: string }) => {
+    mutationFn: async ({ file, checksum, resumeUploadId, thumbnail }: { file: File; checksum: string; resumeUploadId?: string; thumbnail?: string | null }) => {
       const formData = new FormData();
       formData.append("file", file);
       formData.append("forumId", forumId);
       formData.append("checksum", checksum);
       if (resumeUploadId) {
         formData.append("resumeUploadId", resumeUploadId);
+      }
+      if (thumbnail) {
+        formData.append("thumbnail", thumbnail);
       }
 
       // Create XMLHttpRequest for progress tracking
@@ -138,7 +252,7 @@ export function FileUpload({ forumId, onUploadComplete, uploadProgress, onUpload
           reject(new Error("Upload failed"));
         });
 
-        xhr.open("POST", "/api/files/upload");
+        xhr.open("POST", apiUrl("/api/files/upload"));
         xhr.send(formData);
       });
     },
@@ -189,16 +303,23 @@ export function FileUpload({ forumId, onUploadComplete, uploadProgress, onUpload
   const handleUpload = async () => {
     if (!selectedFile || !fileChecksum) return;
 
+    let thumbnail: string | null = null;
+    try {
+      thumbnail = await generateThumbnail(selectedFile);
+    } catch {
+      thumbnail = null;
+    }
+
     // Check for existing partial upload first
     try {
       await checkPartialUploadMutation.mutateAsync(fileChecksum);
       // If no partial upload found, proceed with upload
-      uploadMutation.mutate({ file: selectedFile, checksum: fileChecksum });
+      uploadMutation.mutate({ file: selectedFile, checksum: fileChecksum, thumbnail });
     } catch (error) {
       // If RESUME_REQUIRED error, the dialog will show
       // Otherwise, proceed with upload
       if ((error as Error).message !== "RESUME_REQUIRED") {
-        uploadMutation.mutate({ file: selectedFile, checksum: fileChecksum });
+        uploadMutation.mutate({ file: selectedFile, checksum: fileChecksum, thumbnail });
       }
     }
   };

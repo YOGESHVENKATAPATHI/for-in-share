@@ -821,9 +821,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Calculate file checksum if not provided
       const actualChecksum = checksum || crypto.createHash('sha256').update(fileBuffer).digest('hex');
 
-      // Generate thumbnail for images and videos
+      // Prefer client-generated thumbnail for serverless compatibility.
+      // This avoids relying on native binaries (sharp/ffmpeg) on Vercel.
       let thumbnail: string | undefined;
-      if (mimeType.startsWith('image/')) {
+      const providedThumbnail = typeof req.body.thumbnail === 'string' ? req.body.thumbnail.trim() : '';
+      if (providedThumbnail.startsWith('data:image/')) {
+        thumbnail = providedThumbnail;
+      } else if (mimeType.startsWith('image/')) {
         try {
           const sharp = await import('sharp');
           const thumbnailBuffer = await sharp.default(fileBuffer)
@@ -841,17 +845,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
           const fs = await import('fs/promises');
           const os = await import('os');
           const path = await import('path');
-          
+
           const tempVideoPath = path.join(os.tmpdir(), `temp_video_${crypto.randomUUID()}${path.extname(fileName)}`);
           await fs.writeFile(tempVideoPath, fileBuffer);
-          
+
           // Generate video thumbnail
           const thumbnailBuffer = await generateVideoThumbnail(tempVideoPath);
           if (thumbnailBuffer) {
             thumbnail = `data:image/jpeg;base64,${thumbnailBuffer.toString('base64')}`;
             console.log(`✅ Generated video thumbnail for ${fileName}`);
           }
-          
+
           // Clean up temp file
           await fs.unlink(tempVideoPath);
         } catch (error) {
@@ -4955,6 +4959,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   const httpServer = createServer(app);
+  const isVercelRuntime = process.env.VERCEL === '1' || process.env.VERCEL === 'true';
   
   // Create WebSocket manager
   const wsManager = {
@@ -5021,183 +5026,189 @@ export async function registerRoutes(app: Express): Promise<Server> {
     });
   }
 
-  const wss = new WebSocketServer({
-    server: httpServer,
-    path: '/ws',
-    verifyClient: async (info, callback) => {
-      // Parse cookies to get session
-      const cookies = parseCookies(info.req.headers.cookie || '');
-      const sessionId = cookies['connect.sid'] || cookies['sessionId'];
-      const userAgent = info.req.headers['user-agent'] || 'unknown';
-      const clientIP = info.req.socket.remoteAddress || info.req.connection?.remoteAddress || 'unknown';
+  if (!isVercelRuntime) {
+    const wss = new WebSocketServer({
+      server: httpServer,
+      path: '/ws',
+      verifyClient: async (info, callback) => {
+        // Parse cookies to get session
+        const cookies = parseCookies(info.req.headers.cookie || '');
+        const sessionId = cookies['connect.sid'] || cookies['sessionId'];
+        const userAgent = info.req.headers['user-agent'] || 'unknown';
+        const clientIP = info.req.socket.remoteAddress || info.req.connection?.remoteAddress || 'unknown';
+        const isPingService = userAgent.includes('Forum-Ping-Service');
+
+        console.log(`🔐 WebSocket authentication attempt:`, {
+          hasSessionId: !!sessionId,
+          userAgent: userAgent,
+          ip: clientIP,
+          isPingService: isPingService,
+          timestamp: new Date().toISOString()
+        });
+
+        if (sessionId) {
+          try {
+            // Get session store and check if session exists
+            const sessionStore = sessionSettings.store;
+            if (sessionStore && typeof sessionStore.get === 'function') {
+              sessionStore.get(sessionId.replace('s:', '').split('.')[0], (err: any, session: any) => {
+                if (!err && session && session.passport && session.passport.user) {
+                  // User is authenticated
+                  (info.req as any).userId = session.passport.user;
+                  console.log(`✅ WebSocket authentication successful for user: ${session.passport.user}`);
+                  callback(true);
+                  return;
+                }
+                console.log(`❌ WebSocket authentication failed: Invalid session`);
+                callback(false, 401, 'Unauthorized');
+              });
+              return;
+            }
+          } catch (error) {
+            console.error('Session verification error:', error);
+          }
+        }
+
+        if (isPingService) {
+          console.log(`🚀 Ping service authentication bypassed (no session needed for ping)`);
+          (info.req as any).userId = 'ping-service'; // Special user ID for ping service
+          callback(true); // Allow ping service connections
+          return;
+        }
+
+        console.log(`❌ WebSocket authentication failed: No session ID`);
+        callback(false, 401, 'Unauthorized');
+      }
+    });
+
+    wss.on('connection', (ws: WebSocket, req: any) => {
+      const client: WSClient = { ws };
+      // Get authenticated user ID from request
+      client.userId = (req as any).userId;
+
+      // Log connection details
+      const clientIP = req.socket.remoteAddress || req.connection?.remoteAddress || 'unknown';
+      const userAgent = req.headers['user-agent'] || 'unknown';
       const isPingService = userAgent.includes('Forum-Ping-Service');
 
-      console.log(`🔐 WebSocket authentication attempt:`, {
-        hasSessionId: !!sessionId,
-        userAgent: userAgent,
+      console.log(`🔌 WebSocket client connected:`, {
+        userId: client.userId || 'unauthenticated',
         ip: clientIP,
+        userAgent: userAgent,
         isPingService: isPingService,
         timestamp: new Date().toISOString()
       });
 
-      if (sessionId) {
-        try {
-          // Get session store and check if session exists
-          const sessionStore = sessionSettings.store;
-          if (sessionStore && typeof sessionStore.get === 'function') {
-            sessionStore.get(sessionId.replace('s:', '').split('.')[0], (err: any, session: any) => {
-              if (!err && session && session.passport && session.passport.user) {
-                // User is authenticated
-                (info.req as any).userId = session.passport.user;
-                console.log(`✅ WebSocket authentication successful for user: ${session.passport.user}`);
-                callback(true);
-                return;
-              }
-              console.log(`❌ WebSocket authentication failed: Invalid session`);
-              callback(false, 401, 'Unauthorized');
-            });
-            return;
-          }
-        } catch (error) {
-          console.error('Session verification error:', error);
-        }
-      }
-
       if (isPingService) {
-        console.log(`🚀 Ping service authentication bypassed (no session needed for ping)`);
-        (info.req as any).userId = 'ping-service'; // Special user ID for ping service
-        callback(true); // Allow ping service connections
-        return;
+        console.log('🚀 Ping service connected - keeping server awake!');
       }
 
-      console.log(`❌ WebSocket authentication failed: No session ID`);
-      callback(false, 401, 'Unauthorized');
-    }
-  });
+      clients.set(ws, client);
 
-  wss.on('connection', (ws: WebSocket, req: any) => {
-    const client: WSClient = { ws };
-    // Get authenticated user ID from request
-    client.userId = (req as any).userId;
+      ws.on('message', async (data: Buffer) => {
+        try {
+          const message = JSON.parse(data.toString());
 
-    // Log connection details
-    const clientIP = req.socket.remoteAddress || req.connection?.remoteAddress || 'unknown';
-    const userAgent = req.headers['user-agent'] || 'unknown';
-    const isPingService = userAgent.includes('Forum-Ping-Service');
+          console.log(`💬 WebSocket message received:`, {
+            userId: client.userId || 'unauthenticated',
+            type: message.type,
+            forumId: message.forumId || 'none',
+            hasContent: !!message.content,
+            timestamp: new Date().toISOString()
+          });
 
-    console.log(`🔌 WebSocket client connected:`, {
-      userId: client.userId || 'unauthenticated',
-      ip: clientIP,
-      userAgent: userAgent,
-      isPingService: isPingService,
-      timestamp: new Date().toISOString()
-    });
-
-    if (isPingService) {
-      console.log('🚀 Ping service connected - keeping server awake!');
-    }
-
-    clients.set(ws, client);
-
-    ws.on('message', async (data: Buffer) => {
-      try {
-        const message = JSON.parse(data.toString());
-
-        console.log(`💬 WebSocket message received:`, {
-          userId: client.userId || 'unauthenticated',
-          type: message.type,
-          forumId: message.forumId || 'none',
-          hasContent: !!message.content,
-          timestamp: new Date().toISOString()
-        });
-
-        if (message.type === 'join' && message.forumId) {
-          client.forumId = message.forumId;
-          console.log(`Client joined forum: ${message.forumId}`);
-        }
-
-        if (message.type === 'message' && message.forumId && message.content) {
-          // Check if user has access to the forum and create message in a transaction-like manner
-          const forum = await storage.getForumById(message.forumId);
-          if (!forum) {
-            ws.send(JSON.stringify({
-              type: 'error',
-              message: 'Forum not found'
-            }));
-            return;
+          if (message.type === 'join' && message.forumId) {
+            client.forumId = message.forumId;
+            console.log(`Client joined forum: ${message.forumId}`);
           }
 
-          // Check access for private forums
-          if (!forum.isPublic) {
-            const isMember = await storage.isForumMember(forum.id, client.userId!);
-            if (!isMember) {
+          if (message.type === 'message' && message.forumId && message.content) {
+            // Check if user has access to the forum and create message in a transaction-like manner
+            const forum = await storage.getForumById(message.forumId);
+            if (!forum) {
               ws.send(JSON.stringify({
                 type: 'error',
-                message: 'Access denied'
+                message: 'Forum not found'
               }));
               return;
             }
-          }
 
-          try {
-            // Save message to database with authenticated user
-            const savedMessage = await storage.createMessage(
-              { forumId: message.forumId, content: message.content },
-              client.userId!
-            );
-
-            // Broadcast to all clients in the same forum
-            clients.forEach((c) => {
-              if (c.forumId === message.forumId && c.ws.readyState === WebSocket.OPEN) {
-                c.ws.send(JSON.stringify({
-                  type: 'message',
-                  forumId: message.forumId,
-                  message: savedMessage,
+            // Check access for private forums
+            if (!forum.isPublic) {
+              const isMember = await storage.isForumMember(forum.id, client.userId!);
+              if (!isMember) {
+                ws.send(JSON.stringify({
+                  type: 'error',
+                  message: 'Access denied'
                 }));
+                return;
               }
-            });
-          } catch (error: any) {
-            console.error('Failed to create message:', error);
-
-            // Permission or policy errors
-            if (error?.status === 403) {
-              ws.send(JSON.stringify({ type: 'error', message: error.message || 'Forbidden' }));
-              return;
             }
 
-            // Check if it's a foreign key constraint error
-            if (error?.code === '23503' && error?.constraint === 'messages_forum_id_forums_id_fk') {
-              ws.send(JSON.stringify({ type: 'error', message: 'Forum no longer exists' }));
-              return;
-            }
+            try {
+              // Save message to database with authenticated user
+              const savedMessage = await storage.createMessage(
+                { forumId: message.forumId, content: message.content },
+                client.userId!
+              );
 
-            // For other errors, send a generic error
-            ws.send(JSON.stringify({ type: 'error', message: 'Failed to send message' }));
+              // Broadcast to all clients in the same forum
+              clients.forEach((c) => {
+                if (c.forumId === message.forumId && c.ws.readyState === WebSocket.OPEN) {
+                  c.ws.send(JSON.stringify({
+                    type: 'message',
+                    forumId: message.forumId,
+                    message: savedMessage,
+                  }));
+                }
+              });
+            } catch (error: any) {
+              console.error('Failed to create message:', error);
+
+              // Permission or policy errors
+              if (error?.status === 403) {
+                ws.send(JSON.stringify({ type: 'error', message: error.message || 'Forbidden' }));
+                return;
+              }
+
+              // Check if it's a foreign key constraint error
+              if (error?.code === '23503' && error?.constraint === 'messages_forum_id_forums_id_fk') {
+                ws.send(JSON.stringify({ type: 'error', message: 'Forum no longer exists' }));
+                return;
+              }
+
+              // For other errors, send a generic error
+              ws.send(JSON.stringify({ type: 'error', message: 'Failed to send message' }));
+            }
           }
+        } catch (error) {
+          console.error('WebSocket message error:', error);
         }
-      } catch (error) {
-        console.error('WebSocket message error:', error);
-      }
-    });
-
-    ws.on('close', () => {
-      const wasPingService = req.headers['user-agent']?.includes('Forum-Ping-Service');
-      console.log(`🔌 WebSocket client disconnected:`, {
-        userId: client.userId || 'unauthenticated',
-        wasPingService: wasPingService,
-        timestamp: new Date().toISOString()
       });
 
-      if (wasPingService) {
-        console.log('🚀 Ping service disconnected - server stays awake for next ping!');
-      }
+      ws.on('close', () => {
+        const wasPingService = req.headers['user-agent']?.includes('Forum-Ping-Service');
+        console.log(`🔌 WebSocket client disconnected:`, {
+          userId: client.userId || 'unauthenticated',
+          wasPingService: wasPingService,
+          timestamp: new Date().toISOString()
+        });
 
-      clients.delete(ws);
-    });
+        if (wasPingService) {
+          console.log('🚀 Ping service disconnected - server stays awake for next ping!');
+        }
 
-    ws.on('error', (error) => {
-      console.error('WebSocket error:', error);
-      clients.delete(ws);
+        clients.delete(ws);
+      });
+
+      ws.on('error', (error) => {
+        console.error('WebSocket error:', error);
+        clients.delete(ws);
+      });
     });
-  });  return httpServer;
+  } else {
+    console.log('WebSocket server disabled for Vercel runtime. Client polling fallback should be used.');
+  }
+
+  return httpServer;
 }

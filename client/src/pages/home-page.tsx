@@ -13,6 +13,7 @@ import { CreateForumDialog } from "@/components/create-forum-dialog";
 import { AppFooter } from "@/components/app-footer";
 import { Logo } from "@/components/logo";
 import { cn } from "@/lib/utils";
+import { wsUrl } from "@/lib/runtime-config";
 
 // Helper to generate deterministic patterns based on forum ID
 const getForumPattern = (id: string) => {
@@ -48,6 +49,7 @@ export default function HomePage() {
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
   const [selectedForum, setSelectedForum] = useState<ForumWithCreator | null>(null);
   const [ws, setWs] = useState<WebSocket | null>(null);
+  const [wsConnected, setWsConnected] = useState(false);
 
   // Debounce search query for performance
   useEffect(() => {
@@ -356,9 +358,16 @@ export default function HomePage() {
   useEffect(() => {
     if (!user) return;
 
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
-    const socket = new WebSocket(wsUrl);
+    if (import.meta.env.VITE_DISABLE_WEBSOCKET === "true") {
+      setWsConnected(false);
+      return;
+    }
+
+    const socket = new WebSocket(wsUrl("/ws"));
+
+    socket.onopen = () => {
+      setWsConnected(true);
+    };
 
     socket.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -370,14 +379,34 @@ export default function HomePage() {
       }
     };
 
+    socket.onerror = () => {
+      setWsConnected(false);
+    };
+
+    socket.onclose = () => {
+      setWsConnected(false);
+    };
+
     setWs(socket);
 
     return () => {
+      setWsConnected(false);
       if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
         socket.close();
       }
     };
   }, [user]);
+
+  useEffect(() => {
+    if (!user || wsConnected) return;
+
+    const intervalId = window.setInterval(() => {
+      queryClient.invalidateQueries({ queryKey: ["/api/forums"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/user/pending-requests"] });
+    }, 5000);
+
+    return () => window.clearInterval(intervalId);
+  }, [user, wsConnected]);
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans selection:bg-zinc-100 selection:text-zinc-900">

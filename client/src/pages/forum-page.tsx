@@ -29,6 +29,7 @@ import { StructuredData } from "@/components/structured-data";
 import { MetaTags } from "@/components/meta-tags";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { generateStructuredData } from "@/lib/seo-utils";
+import { wsUrl } from "@/lib/runtime-config";
 
 interface TagItem {
   id: string;
@@ -98,6 +99,7 @@ export default function ForumPage() {
     error?: string;
   } | null>(null);
   const [ws, setWs] = useState<WebSocket | null>(null);
+  const [wsConnected, setWsConnected] = useState(false);
   const [messages, setMessages] = useState<MessageWithUser[]>([]);
   const [viewMode, setViewMode] = useState<"timeline" | "files">("timeline");
   const [previewFile, setPreviewFile] = useState<FileWithChunks | null>(null);
@@ -653,11 +655,14 @@ export default function ForumPage() {
   // WebSocket connection for real-time messages
   useEffect(() => {
     if (!forumId || !user) return;
-    // Only connect WebSocket if user is authenticated
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
-    const socket = new WebSocket(wsUrl);
+    if (import.meta.env.VITE_DISABLE_WEBSOCKET === "true") {
+      setWsConnected(false);
+      return;
+    }
+
+    const socket = new WebSocket(wsUrl("/ws"));
     socket.onopen = () => {
+      setWsConnected(true);
       socket.send(JSON.stringify({ type: "join", forumId }));
     };
     socket.onmessage = (event) => {
@@ -779,20 +784,37 @@ export default function ForumPage() {
 
     socket.onerror = (error) => {
       console.error("WebSocket error:", error);
+      setWsConnected(false);
     };
 
     socket.onclose = () => {
       console.log("WebSocket disconnected");
+      setWsConnected(false);
     };
 
     setWs(socket);
 
     return () => {
+      setWsConnected(false);
       if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
         socket.close();
       }
     };
   }, [forumId, user]);
+
+  useEffect(() => {
+    if (!forumId || !user || wsConnected) return;
+
+    const intervalId = window.setInterval(() => {
+      queryClient.invalidateQueries({ queryKey: ["/api/forums", forumId, "messages"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/forums", forumId, "files"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/forums", forumId, "members"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/forums", forumId, "access-requests"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/partial-uploads"] });
+    }, 5000);
+
+    return () => window.clearInterval(intervalId);
+  }, [forumId, user, wsConnected]);
 
   const handleSendMessage = (e?: React.FormEvent | React.KeyboardEvent) => {
     if (e) e.preventDefault();

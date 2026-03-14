@@ -14,6 +14,389 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
+// server/neon-manager.ts
+var neon_manager_exports = {};
+__export(neon_manager_exports, {
+  default: () => neon_manager_default,
+  getDbSizeBytes: () => getDbSizeBytes,
+  getMainExtractedDb: () => getMainExtractedDb,
+  getNeonDbUrls: () => getNeonDbUrls,
+  importVideoMappingsFromJson: () => importVideoMappingsFromJson,
+  importVideoMappingsIntoAllNeons: () => importVideoMappingsIntoAllNeons,
+  importVideoMappingsToAll: () => importVideoMappingsToAll,
+  replicateExtractedVideoMappings: () => replicateExtractedVideoMappings,
+  setMainExtractedDb: () => setMainExtractedDb,
+  tryReplicateToAnotherNeon: () => tryReplicateToAnotherNeon
+});
+import { Client } from "pg";
+import fetch from "node-fetch";
+import fs from "fs";
+import path from "path";
+async function getNeonDbUrls(opts) {
+  const includeEnv = opts?.includeEnv !== false;
+  const includeBackup = opts?.includeBackup !== false;
+  const includeAirtable = opts?.includeAirtable !== false;
+  const includeHardcoded = opts?.includeHardcoded !== false;
+  const sources = {};
+  let urls = [];
+  if (includeBackup) {
+    const backupStrings = process.env.BACKUP_STRINGS || "";
+    if (backupStrings) {
+      const backupUrls = backupStrings.split(",").map((u) => u.trim()).filter(Boolean);
+      urls = urls.concat(backupUrls.filter((u) => !urls.includes(u)));
+      backupUrls.forEach((u) => sources[u] = "backup");
+      console.log("[NeonManager] Using BACKUP_STRINGS entries:", backupUrls.length);
+    }
+  }
+  if (includeEnv) {
+    const dbUrl = process.env.DATABASE_URL || "";
+    if (dbUrl) {
+      const envUrls = dbUrl.split(",").map((u) => u.trim()).filter(Boolean);
+      urls = urls.concat(envUrls.filter((u) => !urls.includes(u)));
+      envUrls.forEach((u) => sources[u] = "env");
+      console.log("[NeonManager] process.env.DATABASE_URL entries:", envUrls.length);
+    }
+  }
+  const airtableApiKey = process.env.AIRTABLE_API_KEY;
+  const airtableBase = process.env.AIRTABLE_BASE_ID;
+  const airtableTable = process.env.AIRTABLE_TABLE_ID;
+  const skipAirtable = String(process.env.SKIP_AIRTABLE || "").toLowerCase() === "true";
+  if (includeAirtable && !skipAirtable && airtableApiKey && airtableBase && airtableTable) {
+    try {
+      const res = await fetch(`https://api.airtable.com/v0/${airtableBase}/${airtableTable}`, {
+        headers: { Authorization: `Bearer ${airtableApiKey}` }
+      });
+      if (res.ok) {
+        const json = await res.json();
+        const airtableUrls = (json.records || []).map((r) => (r.fields?.connectionstring || "").trim()).filter(Boolean);
+        console.log("[NeonManager] Airtable returned", airtableUrls.length, "urls");
+        airtableUrls.filter((u) => !urls.includes(u)).forEach((u) => {
+          urls.push(u);
+          sources[u] = "airtable";
+        });
+      }
+    } catch (err) {
+      console.warn("Failed to fetch Neon connection strings from Airtable", err);
+    }
+  }
+  const hardcodedExtractedDb = process.env.HARDCODED_EXTRACTED_DB || "";
+  if (includeHardcoded && hardcodedExtractedDb && !urls.includes(hardcodedExtractedDb)) {
+    urls.push(hardcodedExtractedDb);
+    sources[hardcodedExtractedDb] = "hardcoded";
+  }
+  console.log("[NeonManager] Final urls count:", urls.length);
+  console.log("[NeonManager] Url sources sample:", Object.entries(sources).slice(0, 10));
+  try {
+    const { promises: fsp } = await import("fs");
+    const metaPath = path.resolve(process.cwd(), "meta", "extracted_main.json");
+    if (fs.existsSync(metaPath)) {
+      const raw = await fsp.readFile(metaPath, "utf8");
+      const json = JSON.parse(raw);
+      const mainConn = json && json.main || "";
+      if (mainConn && !urls.includes(mainConn)) {
+        urls.unshift(mainConn);
+      } else if (mainConn && urls.includes(mainConn)) {
+        urls.splice(urls.indexOf(mainConn), 1);
+        urls.unshift(mainConn);
+      }
+    }
+  } catch (err) {
+  }
+  return urls;
+}
+async function importVideoMappingsToAll(jsonFilePath, options) {
+  const results = [];
+  const urls = await getNeonDbUrls();
+  for (const url of urls) {
+    try {
+      console.log(`[NeonManager] Importing to ${url}`);
+      const res = await importVideoMappingsFromJson(url, jsonFilePath);
+      results.push({ url, ok: true, res });
+    } catch (err) {
+      console.warn(`[NeonManager] Import failed for ${url}`, err?.message || err);
+      results.push({ url, ok: false, err: String(err?.message || err) });
+    }
+  }
+  return results;
+}
+async function replicateExtractedVideoMappings(sourceConn, targetConn) {
+  const src = new Client({ connectionString: sourceConn });
+  const dst = new Client({ connectionString: targetConn });
+  await src.connect();
+  await dst.connect();
+  try {
+    const tableCheck = await dst.query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings');`);
+    if (!tableCheck.rows[0].exists) {
+      return { inserted: 0, skipped: 0 };
+    }
+    const targetRows = await dst.query("SELECT id FROM video_mappings");
+    const targetIds = new Set(targetRows.rows.map((r) => String(r.id)));
+    const batchSize = 200;
+    let offset = 0;
+    let inserted = 0;
+    let skipped = 0;
+    while (true) {
+      const res = await src.query(`SELECT * FROM video_mappings ORDER BY id LIMIT ${batchSize} OFFSET ${offset}`);
+      if (!res.rows || res.rows.length === 0) break;
+      for (const row of res.rows) {
+        const id = String(row.id);
+        if (targetIds.has(id)) {
+          skipped++;
+          continue;
+        }
+        const cols = Object.keys(row).map((c) => '"' + c + '"').join(", ");
+        const vals = Object.values(row);
+        const placeholders = vals.map((_, i) => `$${i + 1}`).join(", ");
+        try {
+          await dst.query(`INSERT INTO video_mappings (${cols}) VALUES (${placeholders}) ON CONFLICT DO NOTHING`, vals);
+          inserted++;
+          targetIds.add(id);
+        } catch (e) {
+          console.warn("Failed to insert row into target extracted DB", e.message || e);
+        }
+      }
+      if (res.rows.length < batchSize) break;
+      offset += batchSize;
+    }
+    return { inserted, skipped };
+  } finally {
+    await src.end();
+    await dst.end();
+  }
+}
+async function tryReplicateToAnotherNeon(thresholdBytes = 0) {
+  const urls = await getNeonDbUrls();
+  if (urls.length < 2) {
+    console.warn("No additional Neon DBs available to replicate to");
+    return;
+  }
+  const primary = urls[0];
+  const target = urls.find((u) => u !== primary) || urls[1];
+  try {
+    const result = await replicateExtractedVideoMappings(primary, target);
+    console.log(`[NeonManager] Replication done inserted=${result.inserted} skipped=${result.skipped}`);
+  } catch (err) {
+    console.warn("Neon replication failed", err);
+  }
+}
+async function getDbSizeBytes(connString) {
+  try {
+    const { Client: Client2 } = await import("pg");
+    const client = new Client2({ connectionString: connString });
+    await client.connect();
+    const res = await client.query(`SELECT pg_database_size(current_database()) as size`);
+    await client.end();
+    if (!res.rows || res.rows.length === 0) return null;
+    return Number(res.rows[0].size || 0);
+  } catch (err) {
+    console.warn("Failed to get DB size for Neon server", err?.message || err);
+    return null;
+  }
+}
+async function getMainExtractedDb() {
+  const envVal = process.env.HARDCODED_EXTRACTED_DB || null;
+  if (envVal) return envVal;
+  try {
+    const { promises: fsp } = await import("fs");
+    const metaPath = path.resolve(process.cwd(), "meta", "extracted_main.json");
+    if (!fs.existsSync(metaPath)) return null;
+    const raw = await fsp.readFile(metaPath, "utf8");
+    const json = JSON.parse(raw);
+    return json && json.main || null;
+  } catch (err) {
+    return null;
+  }
+}
+async function setMainExtractedDb(connString) {
+  try {
+    const { promises: fsp } = await import("fs");
+    const metaDir = path.resolve(process.cwd(), "meta");
+    if (!fs.existsSync(metaDir)) await fsp.mkdir(metaDir, { recursive: true });
+    const metaPath = path.resolve(metaDir, "extracted_main.json");
+    await fsp.writeFile(metaPath, JSON.stringify({ main: connString }), "utf8");
+  } catch (err) {
+    console.warn("Failed to persist main extracted DB selection", err?.message || err);
+  }
+}
+async function importVideoMappingsFromJson(targetConn, jsonFilePath) {
+  const { promises: fsp } = await import("fs");
+  const path9 = jsonFilePath;
+  const content = await fsp.readFile(path9, "utf-8");
+  let rows;
+  try {
+    rows = JSON.parse(content);
+    if (!Array.isArray(rows)) throw new Error("JSON root is not an array");
+  } catch (err) {
+    console.warn("Failed to parse json file for import", err?.message || err);
+    throw err;
+  }
+  const dst = new Client({ connectionString: targetConn });
+  await dst.connect();
+  try {
+    const tableCheck = await dst.query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings');`);
+    if (!tableCheck.rows[0].exists) {
+      console.log("[NeonManager] video_mappings table not found in target DB; attempting to create minimal schema");
+      try {
+        await dst.query(`CREATE TABLE IF NOT EXISTS video_mappings (
+          id varchar(255) PRIMARY KEY,
+          name text,
+          video text,
+          m3u8 text,
+          image text,
+          thumbnail text,
+          url text,
+          uploaddate timestamp,
+          tags text,
+          uploadedby text,
+          size bigint,
+          type text,
+          duration numeric,
+          last_updated timestamp,
+          meta jsonb
+        );`);
+        console.log("[NeonManager] Created minimal video_mappings table in target DB");
+      } catch (err) {
+        console.warn("[NeonManager] Failed to create video_mappings table in target DB", err?.message || err);
+        return { inserted: 0, skipped: rows.length || 0 };
+      }
+    }
+    const batchSize = 200;
+    let inserted = 0;
+    let skipped = 0;
+    const colRes = await dst.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'video_mappings'`);
+    const allowedCols = new Set(colRes.rows.map((r) => r.column_name));
+    for (let i = 0; i < rows.length; i += batchSize) {
+      const batch = rows.slice(i, i + batchSize);
+      for (const row of batch) {
+        const filteredKeys = Object.keys(row).filter((k) => allowedCols.has(k));
+        if (filteredKeys.length === 0) {
+          skipped++;
+          continue;
+        }
+        const cols = filteredKeys.map((c) => '"' + c + '"').join(", ");
+        const vals = filteredKeys.map((k) => row[k]);
+        const placeholders = vals.map((_, idx) => `$${idx + 1}`).join(", ");
+        try {
+          const res = await dst.query(`INSERT INTO video_mappings (${cols}) VALUES (${placeholders}) ON CONFLICT DO NOTHING`, vals);
+          if (typeof res.rowCount === "number") {
+            if (res.rowCount > 0) inserted += res.rowCount;
+            else skipped++;
+          } else {
+            inserted++;
+          }
+        } catch (err) {
+          skipped++;
+          console.warn("Failed to insert row from json into target extracted DB", err?.message || err);
+        }
+      }
+    }
+    return { inserted, skipped };
+  } finally {
+    await dst.end();
+  }
+}
+async function importVideoMappingsIntoAllNeons(jsonFilePath, opts) {
+  const results = [];
+  const { promises: fsp } = await import("fs");
+  const raw = await fsp.readFile(jsonFilePath, "utf8");
+  const rows = JSON.parse(raw);
+  if (!Array.isArray(rows)) throw new Error("JSON root is not array");
+  console.log("[NeonManager] importVideoMappingsIntoAllNeons: rows length:", rows.length);
+  const urls = await getNeonDbUrls();
+  console.log("[NeonManager] importVideoMappingsIntoAllNeons: will process urls count:", urls.length);
+  for (const url of urls) {
+    console.log(`[NeonManager] importVideoMappingsIntoAllNeons: processing ${url}`);
+    try {
+      const client = new Client({ connectionString: url });
+      await client.connect();
+      const tableCheck = await client.query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings');`);
+      if (!tableCheck.rows[0].exists) {
+        await client.query(`CREATE TABLE IF NOT EXISTS video_mappings (
+          id varchar(255) PRIMARY KEY,
+          name text,
+          video text,
+          m3u8 text,
+          image text,
+          thumbnail text,
+          url text,
+          uploaddate timestamp,
+          tags text,
+          uploadedby text,
+          size bigint,
+          type text,
+          duration numeric,
+          last_updated timestamp,
+          meta jsonb
+        );`);
+      }
+      const allIds = rows.map((r) => String(r.id));
+      const chunkSize = 1e3;
+      const existing = /* @__PURE__ */ new Set();
+      for (let i = 0; i < allIds.length; i += chunkSize) {
+        const chunk = allIds.slice(i, i + chunkSize);
+        const placeholders = chunk.map((_, idx) => `$${idx + 1}`).join(", ");
+        const res = await client.query(`SELECT id FROM video_mappings WHERE id IN (${placeholders})`, chunk);
+        for (const r of res.rows) existing.add(String(r.id));
+      }
+      const colRes = await client.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'video_mappings'`);
+      const allowedCols = new Set(colRes.rows.map((r) => r.column_name));
+      let inserted = 0;
+      let skipped = 0;
+      for (let i = 0; i < rows.length; i += chunkSize) {
+        const batch = rows.slice(i, i + chunkSize);
+        const toInsert = batch.filter((r) => !existing.has(String(r.id)));
+        if (toInsert.length === 0) {
+          skipped += batch.length;
+          continue;
+        }
+        const cols = Object.keys(toInsert[0]).filter((k) => allowedCols.has(k));
+        const colList = cols.map((c) => '"' + c + '"').join(", ");
+        const values = [];
+        const valuePlaceholders = [];
+        toInsert.forEach((row, rowIdx) => {
+          const rowPlaceholders = cols.map((_, colIdx) => `$${rowIdx * cols.length + colIdx + 1}`);
+          valuePlaceholders.push(`(${rowPlaceholders.join(",")})`);
+          cols.forEach((c) => values.push(row[c]));
+        });
+        const query = `INSERT INTO video_mappings (${colList}) VALUES ${valuePlaceholders.join(",")} ON CONFLICT DO NOTHING`;
+        try {
+          const r = await client.query(query, values);
+          if (typeof r.rowCount === "number") inserted += r.rowCount;
+          else inserted += toInsert.length;
+        } catch (err) {
+          console.warn(`[NeonManager] Failed inserting batch to ${url}`, err?.message || err);
+          for (const row of toInsert) {
+            const cols2 = Object.keys(row);
+            const cols2List = cols2.map((c) => '"' + c + '"').join(", ");
+            const vals = Object.values(row);
+            const ph = vals.map((_, idx) => `$${idx + 1}`).join(", ");
+            try {
+              await client.query(`INSERT INTO video_mappings (${cols2List}) VALUES (${ph}) ON CONFLICT DO NOTHING`, vals);
+              inserted++;
+            } catch (e) {
+              skipped++;
+            }
+          }
+        }
+      }
+      await client.end();
+      results.push({ url, inserted, skipped });
+      console.log(`[NeonManager] importVideoMappingsIntoAllNeons: done ${url} inserted=${inserted} skipped=${skipped}`);
+    } catch (err) {
+      console.warn(`[NeonManager] Import to ${url} failed`, err?.message || err);
+      if (!opts?.ignoreErrors) results.push({ url, inserted: 0, skipped: 0, error: String(err?.message || err) });
+      else results.push({ url, inserted: 0, skipped: 0, error: String(err?.message || err) });
+    }
+  }
+  return { perDb: results };
+}
+var neon_manager_default;
+var init_neon_manager = __esm({
+  "server/neon-manager.ts"() {
+    neon_manager_default = { getNeonDbUrls, replicateExtractedVideoMappings, tryReplicateToAnotherNeon, getDbSizeBytes, importVideoMappingsFromJson, importVideoMappingsIntoAllNeons, getMainExtractedDb, setMainExtractedDb };
+  }
+});
+
 // shared/schema.ts
 var schema_exports = {};
 __export(schema_exports, {
@@ -65,7 +448,6 @@ import { z } from "zod";
 var users, adminUsers, adminLogs, forums, forumMembers, accessRequests, messages, comments, tags, fileTags, messageTags, forumTags, files, fileChunks, partialUploads, dbShardMetadata, dropboxAccountUsage, searchAnalytics, popularSearches, usersRelations, adminUsersRelations, adminLogsRelations, forumsRelations, forumMembersRelations, accessRequestsRelations, messagesRelations, commentsRelations, tagsRelations, fileTagsRelations, messageTagsRelations, forumTagsRelations, filesRelations, fileChunksRelations, partialUploadsRelations, insertUserSchema, insertForumSchema, insertMessageSchema, insertCommentSchema, insertAccessRequestSchema;
 var init_schema = __esm({
   "shared/schema.ts"() {
-    "use strict";
     users = pgTable("users", {
       id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
       username: text("username").notNull().unique(),
@@ -503,7 +885,6 @@ async function retryWithBackoff(operation, maxRetries = 3, baseDelay = 1e3, oper
 var parseDatabaseUrls, DatabaseManager, dbManager, db, pool;
 var init_db = __esm({
   "server/db.ts"() {
-    "use strict";
     init_schema();
     dotenv.config();
     neonConfig.webSocketConstructor = ws;
@@ -1055,7 +1436,6 @@ import crypto from "crypto";
 var DropboxManager, dropboxManager;
 var init_dropbox_manager = __esm({
   "server/dropbox-manager.ts"() {
-    "use strict";
     DropboxManager = class {
       accounts = [];
       clients = /* @__PURE__ */ new Map();
@@ -1543,12 +1923,12 @@ var init_dropbox_manager = __esm({
           throw new Error(`Failed to upload chunk after ${this.MAX_RETRIES} attempts`);
         }
       }
-      async downloadChunk(accountId, path8) {
+      async downloadChunk(accountId, path9) {
         const client = this.getClient(accountId);
         if (!client) {
           throw new Error(`Dropbox account ${accountId} not found`);
         }
-        const normalizedPath = path8.startsWith("/") ? path8 : `/${path8}`;
+        const normalizedPath = path9.startsWith("/") ? path9 : `/${path9}`;
         try {
           const response = await client.filesDownload({ path: normalizedPath });
           if ("fileBinary" in response.result && response.result.fileBinary) {
@@ -1560,12 +1940,12 @@ var init_dropbox_manager = __esm({
           throw new Error("Failed to download chunk from Dropbox");
         }
       }
-      async getTemporaryLink(accountId, path8) {
+      async getTemporaryLink(accountId, path9) {
         const client = this.getClient(accountId);
         if (!client) {
           throw new Error(`Dropbox account ${accountId} not found`);
         }
-        const normalizedPath = path8.startsWith("/") ? path8 : `/${path8}`;
+        const normalizedPath = path9.startsWith("/") ? path9 : `/${path9}`;
         try {
           const response = await client.filesGetTemporaryLink({ path: normalizedPath });
           return response.result.link;
@@ -1574,13 +1954,13 @@ var init_dropbox_manager = __esm({
           throw new Error("Failed to get temporary link from Dropbox");
         }
       }
-      async deleteChunk(accountId, path8) {
+      async deleteChunk(accountId, path9) {
         const client = this.getClient(accountId);
         if (!client) {
           console.warn(`Dropbox account ${accountId} not found for deletion`);
           return;
         }
-        const normalizedPath = path8.startsWith("/") ? path8 : `/${path8}`;
+        const normalizedPath = path9.startsWith("/") ? path9 : `/${path9}`;
         try {
           await client.filesDeleteV2({ path: normalizedPath });
         } catch (error) {
@@ -1589,7 +1969,7 @@ var init_dropbox_manager = __esm({
             const status = errAny?.status;
             const summary = errAny?.error?.error_summary || errAny?.error_summary || "";
             if (status === 409 && /path_lookup\/not_found/i.test(summary)) {
-              console.log(`Dropbox delete: path not found (already deleted): ${path8}`);
+              console.log(`Dropbox delete: path not found (already deleted): ${path9}`);
               return;
             }
             if (status === 429 || status >= 500 && status < 600) {
@@ -1735,13 +2115,13 @@ var init_dropbox_manager = __esm({
 // server/storage.ts
 import session from "express-session";
 import connectPg from "connect-pg-simple";
-import fs from "fs";
-import path from "path";
+import fs2 from "fs";
+import path2 from "path";
 import { eq as eq2, and, desc, sql as sql2, inArray, or, ilike, exists, isNotNull } from "drizzle-orm";
 var PostgresSessionStore, DatabaseStorage, storage;
 var init_storage = __esm({
   "server/storage.ts"() {
-    "use strict";
+    init_neon_manager();
     init_schema();
     init_db();
     init_dropbox_manager();
@@ -2137,6 +2517,19 @@ var init_storage = __esm({
       }
       async createMessage(insertMessage, userId) {
         const { instance: userInstance, user } = await this.findUserShard(userId);
+        try {
+          if (user && user.username === "XMaster") {
+            const forums2 = await this.getForums();
+            const xmasterForum = forums2.find((f) => f.name === "Xmaster");
+            if (!xmasterForum || insertMessage.forumId !== xmasterForum.id) {
+              const err = new Error("XMaster account may only post messages in the Xmaster forum");
+              err.status = 403;
+              throw err;
+            }
+          }
+        } catch (err) {
+          throw err;
+        }
         await this.ensureForumInShard(userInstance, insertMessage.forumId, userId);
         const estimatedSize = 500 + insertMessage.content.length * 2;
         try {
@@ -2352,8 +2745,8 @@ var init_storage = __esm({
           );
           allFiles.push(...normalFilesWithChunks);
           try {
-            const { Client } = await import("pg");
-            const extractedDbClient = new Client({
+            const { Client: Client2 } = await import("pg");
+            const extractedDbClient = new Client2({
               connectionString: "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
             });
             await extractedDbClient.connect();
@@ -2368,7 +2761,7 @@ var init_storage = __esm({
             if (!adminUser) {
               console.warn("Admin user not found for Xmaster forum extracted files");
             }
-            const extractedFiles = extractedRows.map((row) => ({
+            const extractedFiles2 = extractedRows.map((row) => ({
               id: `extracted_${row.id}`,
               forumId,
               userId: adminUser?.id || "admin-user-id",
@@ -2402,7 +2795,7 @@ var init_storage = __esm({
               videoUrl: row.video || row.url
               // Use video column or url as videoUrl
             }));
-            allFiles.push(...extractedFiles);
+            allFiles.push(...extractedFiles2);
           } catch (error) {
             console.error("Error fetching extracted files for Xmaster:", error);
           }
@@ -2483,8 +2876,8 @@ var init_storage = __esm({
           return { total: normalCount };
         }
         try {
-          const { Client } = await import("pg");
-          const extractedDbClient = new Client({
+          const { Client: Client2 } = await import("pg");
+          const extractedDbClient = new Client2({
             connectionString: "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
           });
           await extractedDbClient.connect();
@@ -2503,8 +2896,8 @@ var init_storage = __esm({
       async getFileById(id) {
         if (id.startsWith("extracted_")) {
           try {
-            const { Client } = await import("pg");
-            const extractedDbClient = new Client({
+            const { Client: Client2 } = await import("pg");
+            const extractedDbClient = new Client2({
               connectionString: "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
             });
             await extractedDbClient.connect();
@@ -2596,6 +2989,20 @@ var init_storage = __esm({
         const instances = dbManager.getAllInstances();
         const estimatedSize = 500 + fileName.length * 2;
         const primaryInstance = instances[0];
+        try {
+          const user = await this.getUser(userId);
+          if (user && user.username === "XMaster") {
+            const forums2 = await this.getForums();
+            const xmasterForum = forums2.find((f) => f.name === "Xmaster");
+            if (!xmasterForum || forumId !== xmasterForum.id) {
+              const err = new Error("XMaster account may only create files in the Xmaster forum");
+              err.status = 403;
+              throw err;
+            }
+          }
+        } catch (err) {
+          throw err;
+        }
         try {
           const [file] = await primaryInstance.db.insert(files).values({
             forumId,
@@ -2803,8 +3210,8 @@ var init_storage = __esm({
         if (includeExtracted) {
           try {
             console.log(`[Tags] Loading tags from extracted database`);
-            const { Client } = await import("pg");
-            const extractedDbClient = new Client({
+            const { Client: Client2 } = await import("pg");
+            const extractedDbClient = new Client2({
               connectionString: process.env.EXTRACTED_DATABASE_URL || "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
             });
             await extractedDbClient.connect();
@@ -3158,9 +3565,9 @@ var init_storage = __esm({
             }
           }
           try {
-            const hlsDir = path.join(process.cwd(), "storage", "hls", id);
-            if (fs.existsSync(hlsDir)) {
-              fs.rmSync(hlsDir, { recursive: true, force: true });
+            const hlsDir = path2.join(process.cwd(), "storage", "hls", id);
+            if (fs2.existsSync(hlsDir)) {
+              fs2.rmSync(hlsDir, { recursive: true, force: true });
               console.log(`[Storage] Deleted HLS directory: ${hlsDir}`);
             }
           } catch (error) {
@@ -3467,12 +3874,35 @@ var init_storage = __esm({
         try {
           const instances = dbManager.getAllInstances();
           const primaryInstance = instances[0];
-          await primaryInstance.db.insert(searchAnalytics).values({
-            query: query.toLowerCase().trim(),
-            userId,
-            resultsCount,
-            sessionId
-          });
+          let userIdToInsert = null;
+          if (userId) {
+            try {
+              const uRes = await primaryInstance.db.select({ id: users.id }).from(users).where(eq2(users.id, userId)).limit(1);
+              if (uRes && uRes.length > 0) userIdToInsert = userId;
+            } catch (e) {
+              userIdToInsert = null;
+            }
+          }
+          try {
+            await primaryInstance.db.insert(searchAnalytics).values({
+              query: query.toLowerCase().trim(),
+              userId: userIdToInsert,
+              resultsCount,
+              sessionId
+            });
+          } catch (err) {
+            console.warn("[Search] Primary analytics insert failed, retrying without userId", err?.message || err);
+            try {
+              await primaryInstance.db.insert(searchAnalytics).values({
+                query: query.toLowerCase().trim(),
+                userId: null,
+                resultsCount,
+                sessionId
+              });
+            } catch (e) {
+              console.warn("[Search] Failed to insert analytics without userId", e?.message || e);
+            }
+          }
           const normalizedQuery = query.toLowerCase().trim();
           const existingPopular = await primaryInstance.db.select().from(popularSearches).where(eq2(popularSearches.query, normalizedQuery)).limit(1);
           if (existingPopular.length > 0) {
@@ -3554,26 +3984,24 @@ var init_storage = __esm({
         const lowercaseQuery = `%${query.toLowerCase()}%`;
         const targetForum = forumId ? await this.getForumById(forumId) : void 0;
         const includeExtracted = !forumId || targetForum?.name === "Xmaster";
-        let extractedFiles = [];
+        let extractedFiles2 = [];
         if (includeExtracted) {
           try {
             console.log(`[Search] Searching extracted databases for query: "${query}"`);
-            const dbUrl = process.env.DATABASE_URL || "";
-            const dbUrls = dbUrl.split(",").map((url) => url.trim()).filter(Boolean);
-            console.log(`[Search] Found ${dbUrls.length} database URLs to search:`, dbUrls.map((url) => url.split("@")[1]?.split(".")[0] || "unknown"));
-            const hardcodedExtractedDb = "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
-            if (!dbUrls.includes(hardcodedExtractedDb)) {
-              dbUrls.push(hardcodedExtractedDb);
-              console.log(`[Search] Added hardcoded extracted database to search list`);
+            let dbUrls = await neon_manager_default.getNeonDbUrls();
+            if (process.env.NEON_EXTRACTED_ONLY_MAIN === "true") {
+              const main = await neon_manager_default.getMainExtractedDb();
+              if (main) dbUrls = [main];
             }
-            const dbResults = [];
+            console.log(`[Search] Found ${dbUrls.length} database URLs to search:`, dbUrls.map((url) => url.split("@")[1]?.split(".")[0] || "unknown"));
+            const dbResults2 = [];
             for (let i = 0; i < dbUrls.length; i++) {
-              const dbUrl2 = dbUrls[i];
-              const dbIdentifier = dbUrl2.split("@")[1]?.split(".")[0] || `db${i + 1}`;
+              const dbUrl = dbUrls[i];
+              const dbIdentifier = dbUrl.split("@")[1]?.split(".")[0] || `db${i + 1}`;
               console.log(`[Search] Querying database ${i + 1}/${dbUrls.length}: ${dbIdentifier}`);
               try {
-                const { Client } = await import("pg");
-                const client = new Client({ connectionString: dbUrl2 });
+                const { Client: Client2 } = await import("pg");
+                const client = new Client2({ connectionString: dbUrl });
                 await client.connect();
                 const tableCheck = await client.query(`
             SELECT EXISTS (
@@ -3584,7 +4012,7 @@ var init_storage = __esm({
                 if (!tableCheck.rows[0].exists) {
                   console.log(`[Search] Database ${dbIdentifier} does not have video_mappings table, skipping`);
                   await client.end();
-                  dbResults.push({ db: dbIdentifier, hasTable: false, totalFiles: 0, matchingFiles: 0 });
+                  dbResults2.push({ db: dbIdentifier, hasTable: false, totalFiles: 0, matchingFiles: 0 });
                   continue;
                 }
                 console.log(`[Search] Database ${dbIdentifier} has video_mappings table, fetching data...`);
@@ -3696,18 +4124,18 @@ var init_storage = __esm({
                       tags: row.tags ? row.tags.split(",").map((tag) => tag.trim()).filter(Boolean) : [],
                       videoUrl: row.video || row.url
                     }));
-                    extractedFiles.push(...dbFiles);
+                    extractedFiles2.push(...dbFiles);
                     console.log(`[Search] Added ${dbFiles.length} files from database ${dbIdentifier} to results`);
                   }
                 }
-                dbResults.push({ db: dbIdentifier, hasTable: true, totalFiles: rows.length, matchingFiles });
+                dbResults2.push({ db: dbIdentifier, hasTable: true, totalFiles: rows.length, matchingFiles });
               } catch (dbError) {
                 console.error(`[Search] Error querying database ${dbIdentifier}:`, dbError);
-                dbResults.push({ db: dbIdentifier, hasTable: false, totalFiles: 0, matchingFiles: 0, error: dbError.message });
+                dbResults2.push({ db: dbIdentifier, hasTable: false, totalFiles: 0, matchingFiles: 0, error: dbError.message });
               }
             }
-            console.log(`[Search] Database search summary:`, dbResults);
-            console.log(`[Search] Total extracted files from all databases: ${extractedFiles.length}`);
+            console.log(`[Search] Database search summary:`, dbResults2);
+            console.log(`[Search] Total extracted files from all databases: ${extractedFiles2.length}`);
           } catch (error) {
             console.error("[Search] Error searching extracted databases:", error);
           }
@@ -3799,12 +4227,39 @@ var init_storage = __esm({
             )
           )).limit(50);
           const messageResults = await messageQuery;
-          return { forums: forumResults.map((r) => r.forum), files: fileResults, messages: messageResults };
+          const forumMapLocal = {};
+          forumResults.forEach((r) => {
+            forumMapLocal[r.forum.id] = r.forum;
+          });
+          fileResults.forEach((fr) => {
+            if (fr.forum && !forumMapLocal[fr.forum.id]) forumMapLocal[fr.forum.id] = fr.forum;
+          });
+          messageResults.forEach((mr) => {
+            if (mr.forum && !forumMapLocal[mr.forum.id]) forumMapLocal[mr.forum.id] = mr.forum;
+          });
+          return { forums: Object.values(forumMapLocal), files: fileResults, messages: messageResults };
         });
         console.log(`[Search] Merging results from ${results.length} database instances`);
-        const mergedForums = results.flatMap((r) => r.forums);
-        const mergedFiles = results.flatMap((r) => r.files).map((r) => ({ ...r.file, user: r.user, forum: r.forum }));
+        let mergedForums = results.flatMap((r) => r.forums);
+        let mergedFiles = results.flatMap((r) => r.files).map((r) => ({ ...r.file, user: r.user, forum: r.forum }));
         const mergedMessages = results.flatMap((r) => r.messages).map((r) => ({ ...r.message, user: r.user, forum: r.forum }));
+        if (extractedFiles2 && extractedFiles2.length > 0) {
+          const existingIds = new Set(mergedFiles.map((f) => f.id));
+          for (const ef of extractedFiles2) {
+            if (!existingIds.has(ef.id)) mergedFiles.push(ef);
+          }
+        }
+        const forumMap = {};
+        mergedForums.forEach((f) => {
+          forumMap[f.id] = f;
+        });
+        mergedFiles.forEach((f) => {
+          if (f && f.forum && !forumMap[f.forum.id]) forumMap[f.forum.id] = f.forum;
+        });
+        mergedMessages.forEach((m) => {
+          if (m && m.forum && !forumMap[m.forum.id]) forumMap[m.forum.id] = m.forum;
+        });
+        mergedForums = Object.values(forumMap);
         console.log(`[Search] Normal database results for query "${query}":`);
         console.log(`[Search] - Forums: ${mergedForums.length}`);
         console.log(`[Search] - Files: ${mergedFiles.length}`);
@@ -3812,7 +4267,7 @@ var init_storage = __esm({
         console.log(`[Search] Skipping adding extracted files to merged results; if needed use the /api/search/extracted endpoint`);
         console.log(`[Search] Final results for query "${query}":`);
         console.log(`[Search] - Forums: ${mergedForums.length}`);
-        console.log(`[Search] - Files: ${mergedFiles.length} (including ${extractedFiles.length} extracted)`);
+        console.log(`[Search] - Files: ${mergedFiles.length} (including ${extractedFiles2.length} extracted)`);
         console.log(`[Search] - Messages: ${mergedMessages.length}`);
         return {
           forums: mergedForums,
@@ -3824,16 +4279,13 @@ var init_storage = __esm({
         const resultsFiles = [];
         const searchTerms = query.toLowerCase().split(/\s+/).filter((t) => t.length > 0);
         try {
-          const dbUrl = process.env.DATABASE_URL || "";
-          const dbUrls = dbUrl.split(",").map((u) => u.trim()).filter(Boolean);
-          const hardcodedExtractedDb = "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
-          if (!dbUrls.includes(hardcodedExtractedDb)) dbUrls.push(hardcodedExtractedDb);
+          const dbUrls = await neon_manager_default.getNeonDbUrls();
           for (let i = 0; i < dbUrls.length; i++) {
             const url = dbUrls[i];
             const dbIdentifier = url.split("@")[1]?.split(".")[0] || `db${i + 1}`;
             try {
-              const { Client } = await import("pg");
-              const client = new Client({ connectionString: url });
+              const { Client: Client2 } = await import("pg");
+              const client = new Client2({ connectionString: url });
               await client.connect();
               const tableCheck = await client.query(`
             SELECT EXISTS (
@@ -3855,6 +4307,11 @@ var init_storage = __esm({
                 return searchTerms.every((term) => searchableText.includes(term));
               });
               if (filtered.length === 0) continue;
+              if (process.env.NEON_EXTRACTED_FIND_FIRST === "true") {
+                dbResults.push({ db: dbIdentifier, hasTable: true, totalFiles: rows.length, matchingFiles: filtered.length });
+                extractedFiles.push(...filtered.map((row) => ({ ...row, sourceDb: dbIdentifier })));
+                break;
+              }
               const adminUser = await this.getUserByUsername("admin");
               const forums2 = await this.getForums();
               let xmasterForum = forums2.find((f) => f.name === "Xmaster");
@@ -3945,10 +4402,10 @@ var init_storage = __esm({
             return await db3.select().from(files).where(eq2(files.userId, userId));
           });
           for (const file of userFiles) {
-            const hlsDir = path.join(process.cwd(), "storage", "hls", file.id);
-            if (fs.existsSync(hlsDir)) {
+            const hlsDir = path2.join(process.cwd(), "storage", "hls", file.id);
+            if (fs2.existsSync(hlsDir)) {
               try {
-                fs.rmSync(hlsDir, { recursive: true, force: true });
+                fs2.rmSync(hlsDir, { recursive: true, force: true });
                 console.log(`[Storage] Deleted HLS directory: ${hlsDir}`);
               } catch (error) {
                 console.error(`[Storage] Error deleting HLS directory ${hlsDir}:`, error);
@@ -3993,15 +4450,15 @@ var init_storage = __esm({
       }
       async cleanupUserTemporaryFiles(userId) {
         try {
-          const tempDir = path.join(process.cwd(), "temp");
-          if (fs.existsSync(tempDir)) {
-            const files2 = fs.readdirSync(tempDir);
+          const tempDir = path2.join(process.cwd(), "temp");
+          if (fs2.existsSync(tempDir)) {
+            const files2 = fs2.readdirSync(tempDir);
             let cleanedFiles = 0;
             for (const file of files2) {
               if (file.includes(userId)) {
-                const filePath = path.join(tempDir, file);
+                const filePath = path2.join(tempDir, file);
                 try {
-                  fs.unlinkSync(filePath);
+                  fs2.unlinkSync(filePath);
                   cleanedFiles++;
                 } catch (error) {
                   console.error(`[Storage] Error deleting temp file ${filePath}:`, error);
@@ -4037,7 +4494,6 @@ import crypto3 from "crypto";
 var MemoryOptimizer, StreamingFileProcessor, ConnectionPool, memoryOptimizer, connectionPool, globalStreamingProcessor;
 var init_memory_optimizer = __esm({
   "server/memory-optimizer.ts"() {
-    "use strict";
     MemoryOptimizer = class extends EventEmitter2 {
       connections = /* @__PURE__ */ new Map();
       monitoringInterval = null;
@@ -4549,7 +5005,6 @@ function setupSessionRoutes(app2) {
 var SessionManager, sessionManager;
 var init_session_manager = __esm({
   "server/session-manager.ts"() {
-    "use strict";
     init_storage();
     SessionManager = class {
       activeSessions = /* @__PURE__ */ new Map();
@@ -4672,8 +5127,8 @@ var init_session_manager = __esm({
       }
       async cleanupTemporaryFiles(session3) {
         try {
-          const fs4 = await import("fs").then((m) => m.promises);
-          const path8 = await import("path");
+          const fs6 = await import("fs").then((m) => m.promises);
+          const path9 = await import("path");
           const tempDirs = [
             "./uploads/temp",
             "./storage/temp",
@@ -4681,17 +5136,17 @@ var init_session_manager = __esm({
           ];
           for (const tempDir of tempDirs) {
             try {
-              const dirExists = await fs4.access(tempDir).then(() => true).catch(() => false);
+              const dirExists = await fs6.access(tempDir).then(() => true).catch(() => false);
               if (!dirExists) continue;
-              const files2 = await fs4.readdir(tempDir);
+              const files2 = await fs6.readdir(tempDir);
               let cleanedFiles = 0;
               for (const file of files2) {
                 try {
-                  const filePath = path8.join(tempDir, file);
-                  const stats = await fs4.stat(filePath);
+                  const filePath = path9.join(tempDir, file);
+                  const stats = await fs6.stat(filePath);
                   const fileAge = Date.now() - stats.mtime.getTime();
                   if (fileAge > 60 * 60 * 1e3) {
-                    await fs4.unlink(filePath);
+                    await fs6.unlink(filePath);
                     cleanedFiles++;
                   }
                 } catch (error) {
@@ -4775,7 +5230,6 @@ import axios3 from "axios";
 var ClusterManager, clusterManager;
 var init_cluster_manager = __esm({
   "server/cluster-manager.ts"() {
-    "use strict";
     ClusterManager = class {
       workers = /* @__PURE__ */ new Map();
       healthCheckInterval = null;
@@ -4966,9 +5420,9 @@ var init_cluster_manager = __esm({
       getWorkerById(id) {
         return this.workers.get(id) || null;
       }
-      async forwardRequest(worker, path8, method = "GET", data, headers) {
+      async forwardRequest(worker, path9, method = "GET", data, headers) {
         try {
-          const url = `${worker.url}${path8}`;
+          const url = `${worker.url}${path9}`;
           const config = {
             method,
             url,
@@ -4993,12 +5447,12 @@ var init_cluster_manager = __esm({
           throw error;
         }
       }
-      async broadcastToWorkers(path8, data, workerType) {
+      async broadcastToWorkers(path9, data, workerType) {
         const workers = Array.from(this.workers.values()).filter(
           (w) => w.status === "healthy" && (!workerType || w.type === workerType || w.type === "general")
         );
         const promises = workers.map(
-          (worker) => this.forwardRequest(worker, path8, "POST", data).catch((error) => console.warn(`Broadcast failed to ${worker.id}:`, error.message))
+          (worker) => this.forwardRequest(worker, path9, "POST", data).catch((error) => console.warn(`Broadcast failed to ${worker.id}:`, error.message))
         );
         await Promise.allSettled(promises);
       }
@@ -5067,7 +5521,6 @@ import axios4 from "axios";
 var LoadBalancer, loadBalancer;
 var init_load_balancer = __esm({
   "server/load-balancer.ts"() {
-    "use strict";
     init_cluster_manager();
     LoadBalancer = class {
       config;
@@ -5172,11 +5625,11 @@ var init_load_balancer = __esm({
           }
         }
       }
-      determineRequestType(path8) {
-        if (path8.includes("/files/upload") || path8.includes("/files/download")) {
+      determineRequestType(path9) {
+        if (path9.includes("/files/upload") || path9.includes("/files/download")) {
           return "upload";
         }
-        if (path8.includes("/messages") || path8.includes("/websocket")) {
+        if (path9.includes("/messages") || path9.includes("/websocket")) {
           return "chat";
         }
         return "general";
@@ -5402,7 +5855,7 @@ var init_load_balancer = __esm({
 // server/index.ts
 import dotenv2 from "dotenv";
 import express3 from "express";
-import path7 from "path";
+import path8 from "path";
 import { fileURLToPath } from "url";
 
 // server/routes.ts
@@ -5411,7 +5864,7 @@ import { createServer } from "http";
 import { WebSocketServer, WebSocket as WebSocket2 } from "ws";
 import multer2 from "multer";
 import crypto6 from "crypto";
-import path3 from "path";
+import path4 from "path";
 import ffmpeg2 from "fluent-ffmpeg";
 import { path as ffmpegPath2 } from "@ffmpeg-installer/ffmpeg";
 import { path as ffprobePath2 } from "@ffprobe-installer/ffprobe";
@@ -5619,7 +6072,8 @@ init_dropbox_manager();
 init_db();
 init_schema();
 import { fromZodError } from "zod-validation-error";
-import fetch from "node-fetch";
+import fetch2 from "node-fetch";
+import fs3 from "fs";
 
 // server/keep-alive.ts
 init_db();
@@ -5935,6 +6389,30 @@ var KeepAliveService = class {
           global.gc();
           console.log("\u{1F5D1}\uFE0F Garbage collection triggered due to high memory usage");
         }
+      }
+      try {
+        const neonManager = await Promise.resolve().then(() => (init_neon_manager(), neon_manager_exports));
+        const urls = await neonManager.default.getNeonDbUrls();
+        const thresholdBytes = parseInt(process.env.NEON_DB_MAX_BYTES || String(0), 10) || 0;
+        if (thresholdBytes > 0 && urls && urls.length > 0) {
+          const primary = urls[0];
+          const size = await neonManager.getDbSizeBytes(primary);
+          if (size !== null) {
+            console.log(`[KeepAlive] Primary Neon DB size: ${size} bytes`);
+            if (size >= thresholdBytes) {
+              console.log(`[KeepAlive] Primary Neon DB reached threshold ${thresholdBytes}, triggering replication`);
+              (async () => {
+                try {
+                  await neonManager.default.tryReplicateToAnotherNeon(thresholdBytes);
+                } catch (err) {
+                  console.warn("[KeepAlive] Neon replication attempt failed", err);
+                }
+              })();
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("[KeepAlive] Neon manager check failed", err?.message || err);
       }
     } catch (error) {
       console.warn("\u26A0\uFE0F Background task failed:", error.message);
@@ -6799,7 +7277,8 @@ import { Transform as Transform2 } from "stream";
 import { createHash } from "crypto";
 import { createReadStream, unlink } from "fs";
 import { pipeline } from "stream/promises";
-import path2 from "path";
+import path3 from "path";
+import os from "os";
 import sharp from "sharp";
 import ffmpeg from "fluent-ffmpeg";
 import { path as ffmpegPath } from "@ffmpeg-installer/ffmpeg";
@@ -6914,8 +7393,8 @@ async function processStreamingUpload(filePath, originalName, forumId, userId, d
     const readStream = createReadStream(filePath);
     await pipeline(readStream, processor);
     const chunkResults = await Promise.all(uploadPromises);
-    const fs4 = await import("fs/promises");
-    const stats = await fs4.stat(filePath);
+    const fs6 = await import("fs/promises");
+    const stats = await fs6.stat(filePath);
     let thumbnail;
     const mimeType = getMimeType(originalName);
     if (mimeType.startsWith("image/")) {
@@ -6940,7 +7419,7 @@ async function processStreamingUpload(filePath, originalName, forumId, userId, d
     const fileRecord = await storage2.createFile(
       forumId,
       userId,
-      path2.basename(originalName),
+      path3.basename(originalName),
       stats.size,
       mimeType,
       thumbnail,
@@ -6951,7 +7430,7 @@ async function processStreamingUpload(filePath, originalName, forumId, userId, d
         // Identifier for user uploads
         metaTitle: originalName,
         metaDescription: `File uploaded to forum`,
-        keywords: path2.extname(originalName).slice(1)
+        keywords: path3.extname(originalName).slice(1)
       }
     );
     console.log(`\u2705 Created file record in database: ${fileRecord.id}`);
@@ -6991,7 +7470,7 @@ async function processStreamingUpload(filePath, originalName, forumId, userId, d
   }
 }
 function getMimeType(filename) {
-  const ext = path2.extname(filename).toLowerCase();
+  const ext = path3.extname(filename).toLowerCase();
   const mimeTypes = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -7044,16 +7523,16 @@ async function generateVideoThumbnail(videoPath) {
     const tempThumbnailPath = `${videoPath}.thumb.jpg`;
     ffmpeg(videoPath).screenshots({
       count: 1,
-      folder: path2.dirname(videoPath),
-      filename: path2.basename(tempThumbnailPath),
+      folder: path3.dirname(videoPath),
+      filename: path3.basename(tempThumbnailPath),
       timemarks: ["10%"],
       // Take thumbnail at 10% of video duration
       size: "300x300"
     }).on("end", async () => {
       try {
-        const fs4 = await import("fs/promises");
-        const thumbnailBuffer = await fs4.readFile(tempThumbnailPath);
-        await fs4.unlink(tempThumbnailPath);
+        const fs6 = await import("fs/promises");
+        const thumbnailBuffer = await fs6.readFile(tempThumbnailPath);
+        await fs6.unlink(tempThumbnailPath);
         resolve(thumbnailBuffer);
       } catch (error) {
         console.warn("Failed to read/cleanup video thumbnail:", error);
@@ -7185,6 +7664,7 @@ function registerStreamingUploadRoutes(app2, requireAuth, clients2, storage2, dr
           }));
         }
       });
+      const uploader = await storage2.getUser(req.user.id);
       clients2.forEach((client) => {
         if (client.ws.readyState === WebSocket.OPEN && client.forumId === forumId) {
           client.ws.send(JSON.stringify({
@@ -7195,6 +7675,8 @@ function registerStreamingUploadRoutes(app2, requireAuth, clients2, storage2, dr
               originalName: fileName,
               size: result.totalSize,
               uploadedBy: req.user.id,
+              uploadedByName: uploader?.displayName || uploader?.username || null,
+              uploader,
               forumId,
               checksum: result.checksum
             }
@@ -7837,8 +8319,8 @@ async function registerRoutes(app2) {
         return res.status(400).json({ error: "id is required" });
       }
       const connectionString = "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
-      const { Client } = await import("pg");
-      const client = new Client({ connectionString });
+      const { Client: Client2 } = await import("pg");
+      const client = new Client2({ connectionString });
       await client.connect();
       await client.query(
         "UPDATE video_mappings SET tags = $1, last_updated = NOW() WHERE id = $2",
@@ -7914,7 +8396,10 @@ async function registerRoutes(app2) {
       }
       const actualChecksum = checksum || crypto6.createHash("sha256").update(fileBuffer).digest("hex");
       let thumbnail;
-      if (mimeType.startsWith("image/")) {
+      const providedThumbnail = typeof req.body.thumbnail === "string" ? req.body.thumbnail.trim() : "";
+      if (providedThumbnail.startsWith("data:image/")) {
+        thumbnail = providedThumbnail;
+      } else if (mimeType.startsWith("image/")) {
         try {
           const sharp2 = await import("sharp");
           const thumbnailBuffer = await sharp2.default(fileBuffer).resize(300, 300, { fit: "inside", withoutEnlargement: true }).jpeg({ quality: 80 }).toBuffer();
@@ -7925,17 +8410,17 @@ async function registerRoutes(app2) {
         }
       } else if (mimeType.startsWith("video/")) {
         try {
-          const fs4 = await import("fs/promises");
+          const fs6 = await import("fs/promises");
           const os2 = await import("os");
-          const path8 = await import("path");
-          const tempVideoPath = path8.join(os2.tmpdir(), `temp_video_${crypto6.randomUUID()}${path8.extname(fileName)}`);
-          await fs4.writeFile(tempVideoPath, fileBuffer);
+          const path9 = await import("path");
+          const tempVideoPath = path9.join(os2.tmpdir(), `temp_video_${crypto6.randomUUID()}${path9.extname(fileName)}`);
+          await fs6.writeFile(tempVideoPath, fileBuffer);
           const thumbnailBuffer = await generateVideoThumbnail2(tempVideoPath);
           if (thumbnailBuffer) {
             thumbnail = `data:image/jpeg;base64,${thumbnailBuffer.toString("base64")}`;
             console.log(`\u2705 Generated video thumbnail for ${fileName}`);
           }
-          await fs4.unlink(tempVideoPath);
+          await fs6.unlink(tempVideoPath);
         } catch (error) {
           console.warn(`Failed to generate video thumbnail for ${fileName}:`, error);
         }
@@ -8066,12 +8551,18 @@ async function registerRoutes(app2) {
         }
         console.log(`\u{1F389} Successfully processed all ${numChunks} chunks`);
         await storage.deletePartialUpload(partialUpload.id);
+        const uploader = await storage.getUser(req.user.id);
+        const fileWithUser = { ...file, user: uploader };
         clients.forEach((c) => {
           if (c.ws.readyState === WebSocket2.OPEN) {
             c.ws.send(JSON.stringify({
               type: "file_uploaded",
               forumId,
-              file
+              data: {
+                file: fileWithUser,
+                filename: fileWithUser.fileName,
+                forumId
+              }
             }));
           }
         });
@@ -8502,7 +8993,7 @@ async function registerRoutes(app2) {
             console.log(`[SmartSeek] Range header: bytes=${startByte}-${endByte}`);
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 15e3);
-            const response = await fetch(file.directDownloadUrl, {
+            const response = await fetch2(file.directDownloadUrl, {
               headers: {
                 "Range": `bytes=${startByte}-${endByte}`,
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -8629,7 +9120,7 @@ async function registerRoutes(app2) {
           try {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 15e3);
-            const response = await fetch(file.directDownloadUrl, {
+            const response = await fetch2(file.directDownloadUrl, {
               headers: {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
               },
@@ -8761,9 +9252,9 @@ async function registerRoutes(app2) {
       const segmentSizes = [];
       for (const segmentUrl of segments) {
         try {
-          let response = await fetch(segmentUrl, { method: "HEAD", headers: defaultHeaders });
+          let response = await fetch2(segmentUrl, { method: "HEAD", headers: defaultHeaders });
           if (!response.ok) {
-            response = await fetch(segmentUrl, { method: "GET", headers: { ...defaultHeaders, Range: "bytes=0-0" } });
+            response = await fetch2(segmentUrl, { method: "GET", headers: { ...defaultHeaders, Range: "bytes=0-0" } });
           }
           if (response.ok) {
             const contentLength = response.headers.get("content-length");
@@ -8819,7 +9310,7 @@ async function registerRoutes(app2) {
         }
         console.log(`[M3U8 Stream] Streaming segment ${i + 1}/${segments.length}: ${segmentUrl}`);
         try {
-          const response = await fetch(segmentUrl, { headers: defaultHeaders });
+          const response = await fetch2(segmentUrl, { headers: defaultHeaders });
           if (!response.ok) {
             console.error(`[M3U8 Stream] Failed to fetch segment ${i}: ${response.status}`);
             continue;
@@ -8856,7 +9347,7 @@ async function registerRoutes(app2) {
       console.log(`[M3U8 Parse] Fetching playlist from:`, m3u8Url);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 15e3);
-      const response = await fetch(m3u8Url, {
+      const response = await fetch2(m3u8Url, {
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
           ...headers || {}
@@ -9002,7 +9493,7 @@ Referer: ${defaultHeaders["Referer"]}\r
         try {
           const controller = new AbortController();
           const timeoutId = setTimeout(() => controller.abort(), 2e4);
-          rangeResponse = await fetch(currentUrl, {
+          rangeResponse = await fetch2(currentUrl, {
             headers: {
               "Range": `bytes=${start}-${end}`,
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -9199,7 +9690,7 @@ Referer: ${defaultHeaders["Referer"]}\r
           if (chunk.downloadUrl) {
             const rangeStart = dataStart;
             const rangeEnd = dataEnd;
-            const chunkResponse = await fetch(chunk.downloadUrl, {
+            const chunkResponse = await fetch2(chunk.downloadUrl, {
               headers: {
                 "Range": `bytes=${rangeStart}-${rangeEnd}`,
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -9230,7 +9721,7 @@ Referer: ${defaultHeaders["Referer"]}\r
               const tempLink = await dropboxManager.getTemporaryLink(chunk.dropboxAccountId, chunk.dropboxPath);
               const rangeStart = dataStart;
               const rangeEnd = dataEnd;
-              const chunkResponse = await fetch(tempLink, {
+              const chunkResponse = await fetch2(tempLink, {
                 headers: { "Range": `bytes=${rangeStart}-${rangeEnd}` }
               });
               if (chunkResponse.ok && chunkResponse.body) {
@@ -9296,7 +9787,7 @@ Referer: ${defaultHeaders["Referer"]}\r
       console.log(`[StreamChunks] Processing chunk ${i + 1}/${chunks.length}: index=${chunk.chunkIndex}, size=${Math.round(chunk.size / 1024)}KB`);
       try {
         if (chunk.downloadUrl) {
-          const chunkResponse = await fetch(chunk.downloadUrl);
+          const chunkResponse = await fetch2(chunk.downloadUrl);
           if (chunkResponse.ok && chunkResponse.body) {
             const reader = chunkResponse.body.getReader();
             try {
@@ -9317,7 +9808,7 @@ Referer: ${defaultHeaders["Referer"]}\r
           let streamed = false;
           try {
             const tempLink = await dropboxManager.getTemporaryLink(chunk.dropboxAccountId, chunk.dropboxPath);
-            const chunkResponse = await fetch(tempLink);
+            const chunkResponse = await fetch2(tempLink);
             if (chunkResponse.ok && chunkResponse.body) {
               const reader = chunkResponse.body.getReader();
               try {
@@ -9397,6 +9888,47 @@ Referer: ${defaultHeaders["Referer"]}\r
           return res.sendStatus(401);
         }
       }
+      if (isExtractedFile) {
+        try {
+          let hostHeader = req.get("host") || "localhost:5000";
+          hostHeader = hostHeader.replace("[::1]", "127.0.0.1").replace("::1", "127.0.0.1");
+          const resolveUrl = `${req.protocol}://${hostHeader}/api/extracted/${encodeURIComponent(req.params.id)}/resolve`;
+          console.log(`[Download] Resolving extracted file via ${resolveUrl}`);
+          const r = await fetch2(resolveUrl, { headers: { "User-Agent": "Node.js" } });
+          if (!r.ok) {
+            console.warn("[Download] Failed to resolve extracted file", await r.text());
+            return res.status(502).send("Failed to resolve extracted file");
+          }
+          const body = await r.json();
+          const chosenProxy = body.localProxyUrl ? `${req.protocol}://${hostHeader}${body.localProxyUrl}` : body.proxiedUrl || body.resolvedUrl;
+          if (!chosenProxy) return res.status(404).send("Could not resolve mp4 for this extracted file");
+          console.log(`[Download] Streaming resolved URL for ${file.fileName}: ${chosenProxy}`);
+          const upstreamHeaders = { "User-Agent": "Node.js" };
+          if (req.headers.range) upstreamHeaders["Range"] = req.headers.range;
+          const upstreamResp = await fetch2(chosenProxy, { headers: upstreamHeaders });
+          if (!upstreamResp.ok && upstreamResp.status !== 206) {
+            console.warn("[Download] Upstream fetch failed:", upstreamResp.status);
+            return res.status(502).send("Failed to fetch resolved file");
+          }
+          const contentType = upstreamResp.headers.get("content-type") || file.mimeType || "application/octet-stream";
+          const contentLength = upstreamResp.headers.get("content-length");
+          const contentRange = upstreamResp.headers.get("content-range");
+          res.setHeader("Content-Type", contentType);
+          res.setHeader("Accept-Ranges", "bytes");
+          if (contentLength) res.setHeader("Content-Length", contentLength);
+          if (contentRange) {
+            res.status(206);
+            res.setHeader("Content-Range", contentRange);
+          } else {
+            res.setHeader("Content-Disposition", `attachment; filename="${file.fileName}"`);
+          }
+          upstreamResp.body?.pipe(res);
+          return;
+        } catch (err) {
+          console.error("[Download] Error resolving extracted file:", err);
+          return res.status(500).send("Error resolving extracted file");
+        }
+      }
       if (file.isAdminCreated && file.directDownloadUrl) {
         if (file.mimeType === "application/x-mpegurl" || file.directDownloadUrl.toLowerCase().endsWith(".m3u8")) {
           console.log(`[Download] Detected M3U8 file, transcoding to MP4 for download: ${file.fileName}`);
@@ -9409,7 +9941,7 @@ Referer: ${defaultHeaders["Referer"]}\r
           }
         }
         try {
-          const response = await fetch(file.directDownloadUrl);
+          const response = await fetch2(file.directDownloadUrl);
           if (!response.ok) {
             throw new Error(`Failed to fetch: ${response.status}`);
           }
@@ -9458,7 +9990,7 @@ Referer: ${defaultHeaders["Referer"]}\r
           let chunkData;
           if (chunk.downloadUrl) {
             console.log(`\u{1F4E5} Downloading chunk ${chunk.chunkIndex} from permanent URL`);
-            const response = await fetch(chunk.downloadUrl);
+            const response = await fetch2(chunk.downloadUrl);
             if (!response.ok) {
               throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
@@ -9511,7 +10043,7 @@ Referer: ${defaultHeaders["Referer"]}\r
       try {
         let chunkData;
         if (chunk.downloadUrl) {
-          const response = await fetch(chunk.downloadUrl);
+          const response = await fetch2(chunk.downloadUrl);
           if (!response.ok) {
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
           }
@@ -10348,9 +10880,9 @@ Referer: ${defaultHeaders["Referer"]}\r
       const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit || "20"), 10)));
       const offset = Math.max(0, parseInt(String(req.query.offset || "0"), 10));
       const localResults = await storage.searchEntities(query, req.user?.id, forumId);
-      const extractedFiles = await storage.searchExtractedFiles(query, forumId);
+      const extractedFiles2 = await storage.searchExtractedFiles(query, forumId);
       const allFilesMap = {};
-      for (const f of [...localResults.files, ...extractedFiles]) {
+      for (const f of [...localResults.files, ...extractedFiles2]) {
         allFilesMap[f.id] = f;
       }
       const mergedFiles = Object.values(allFilesMap).sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
@@ -10376,6 +10908,92 @@ Referer: ${defaultHeaders["Referer"]}\r
       res.json({ files: files2, totalFiles });
     } catch (error) {
       next(error);
+    }
+  });
+  app2.post("/api/neon/replicate", requireAuth, async (req, res, next) => {
+    try {
+      const targetConn = req.body && req.body.targetConn || void 0;
+      const neonManagerImport = await Promise.resolve().then(() => (init_neon_manager(), neon_manager_exports));
+      const neonManager = neonManagerImport.default;
+      const urls = await neonManager.getNeonDbUrls();
+      if (!urls || urls.length < 2) return res.status(400).json({ ok: false, message: "No available Neon DBs to replicate to" });
+      const primary = urls[0];
+      if (targetConn) {
+        const result = await neonManager.default.replicateExtractedVideoMappings(primary, targetConn);
+        return res.json({ ok: true, inserted: result.inserted, skipped: result.skipped });
+      }
+      const target = urls.find((u) => u !== primary);
+      if (!target) return res.status(400).json({ ok: false, message: "No target Neon DB found" });
+      (async () => {
+        try {
+          const result = await neonManager.default.replicateExtractedVideoMappings(primary, target);
+          console.log("[Neon] Background replication finished:", result);
+        } catch (err) {
+          console.warn("[Neon] Background replication failed", err);
+        }
+      })();
+      return res.status(202).json({ ok: true, message: "Replication started", target });
+    } catch (err) {
+      next(err);
+    }
+  });
+  app2.post("/api/neon/import-backup", requireAuth, async (req, res, next) => {
+    try {
+      const { targetConn, filePath } = req.body || {};
+      const neonManager = await Promise.resolve().then(() => (init_neon_manager(), neon_manager_exports));
+      const urls = await neonManager.default.getNeonDbUrls();
+      if (!urls || urls.length === 0) return res.status(400).json({ ok: false, message: "No Neon DBs available" });
+      let target = targetConn;
+      if (!target) {
+        let minSize = Number.MAX_SAFE_INTEGER;
+        let chosen = urls[0];
+        for (const u of urls) {
+          const size = await neonManager.getDbSizeBytes(u);
+          if (size === null) continue;
+          if (size === 0) {
+            chosen = u;
+            break;
+          }
+          if (size < minSize) {
+            minSize = size;
+            chosen = u;
+          }
+        }
+        target = chosen;
+      }
+      const candidatePath = filePath || path4.resolve(process.cwd(), "video_mappings.json");
+      if (!fs3.existsSync(candidatePath)) return res.status(404).json({ ok: false, message: "Backup file not found" });
+      (async () => {
+        try {
+          const result = await neonManager.importVideoMappingsFromJson(target, candidatePath);
+          console.log("[NeonImport] Import completed", result);
+          try {
+            await neonManager.setMainExtractedDb(target);
+          } catch (e) {
+            console.warn("Failed to set main extracted DB", e);
+          }
+        } catch (err) {
+          console.warn("[NeonImport] Import failed", err?.message || err);
+        }
+      })();
+      return res.status(202).json({ ok: true, message: "Import started", target });
+    } catch (err) {
+      next(err);
+    }
+  });
+  app2.get("/api/neon/list", requireAuth, async (req, res, next) => {
+    try {
+      const neonManagerImport = await Promise.resolve().then(() => (init_neon_manager(), neon_manager_exports));
+      const neonManager = neonManagerImport.default;
+      const urls = await neonManager.getNeonDbUrls();
+      const list = [];
+      for (const u of urls) {
+        const size = await neonManager.getDbSizeBytes(u);
+        list.push({ url: u, size });
+      }
+      return res.json({ ok: true, list });
+    } catch (err) {
+      next(err);
     }
   });
   app2.get("/api/search/stream", optionalAuth, async (req, res, next) => {
@@ -10494,7 +11112,22 @@ data: ${JSON.stringify({ source: "local", count: localStreamedCount })}
           }
           const forumQuery = instance.db.select({ forum: forums }).from(forums).leftJoin(forumMembers, and2(eq3(forumMembers.forumId, forums.id), userId ? eq3(forumMembers.userId, userId) : sql3`1=0`)).where(and2(
             or2(eq3(forums.isPublic, true), userId ? eq3(forums.creatorId, userId) : sql3`1=0`, userId ? isNotNull2(forumMembers.id) : sql3`1=0`),
-            or2(ilike2(forums.name, lower2), ilike2(forums.description, lower2), exists2(instance.db.select().from(forumTags).innerJoin(tags, eq3(forumTags.tagId, tags.id)).where(and2(eq3(forumTags.forumId, forums.id), ilike2(tags.name, lower2)))))
+            or2(
+              ilike2(forums.name, lower2),
+              ilike2(forums.description, lower2),
+              exists2(instance.db.select().from(forumTags).innerJoin(tags, eq3(forumTags.tagId, tags.id)).where(and2(eq3(forumTags.forumId, forums.id), ilike2(tags.name, lower2)))),
+              exists2(instance.db.select().from(files).where(and2(eq3(files.forumId, forums.id), or2(
+                ilike2(files.fileName, lower2),
+                and2(isNotNull2(files.metaTitle), ilike2(files.metaTitle, lower2)),
+                and2(isNotNull2(files.metaDescription), ilike2(files.metaDescription, lower2)),
+                and2(isNotNull2(files.keywords), ilike2(files.keywords, lower2)),
+                and2(isNotNull2(files.adminNotes), ilike2(files.adminNotes, lower2))
+              )))),
+              exists2(instance.db.select().from(messages).where(and2(eq3(messages.forumId, forums.id), or2(
+                ilike2(messages.content, lower2),
+                exists2(instance.db.select().from(messageTags).innerJoin(tags, eq3(messageTags.tagId, tags.id)).where(and2(eq3(messageTags.messageId, messages.id), ilike2(tags.name, lower2))))
+              ))))
+            )
           ));
           const forumRows = await forumQuery.limit(20);
           for (const r of forumRows) {
@@ -10535,10 +11168,7 @@ data: {}
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
       res.flushHeaders?.();
-      const dbUrl = process.env.DATABASE_URL || "";
-      const dbUrls = dbUrl.split(",").map((u) => u.trim()).filter(Boolean);
-      const hardcodedExtractedDb = "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
-      if (!dbUrls.includes(hardcodedExtractedDb)) dbUrls.push(hardcodedExtractedDb);
+      const dbUrls = await (await Promise.resolve().then(() => (init_neon_manager(), neon_manager_exports))).default.getNeonDbUrls();
       const searchTerms = query.toLowerCase().split(/\s+/).filter((t) => t.length > 0);
       const batchSize = 5;
       let extractedStreamedCount = 0;
@@ -10546,8 +11176,8 @@ data: {}
         const dbU = dbUrls[i];
         const dbIdentifier = dbU.split("@")[1]?.split(".")[0] || `db${i + 1}`;
         try {
-          const { Client } = await import("pg");
-          const client = new Client({ connectionString: dbU });
+          const { Client: Client2 } = await import("pg");
+          const client = new Client2({ connectionString: dbU });
           await client.connect();
           const tableCheck = await client.query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings');`);
           if (!tableCheck.rows[0].exists) {
@@ -10630,6 +11260,127 @@ data: {}
 
 `);
       res.end();
+    } catch (error) {
+      next(error);
+    }
+  });
+  const resolvedExtractedCache = /* @__PURE__ */ new Map();
+  const RESOLVE_TTL_MS = 60 * 1e3;
+  const VERCEL_PROXY_BASE = process.env.VERCEL_PROXY_BASE || "https://webproxier-ov6et6gpw-ogeshs-projects.vercel.app/api/proxy?url=";
+  app2.get("/api/extracted/:id/resolve", optionalAuth, async (req, res, next) => {
+    try {
+      const idParam = req.params.id;
+      if (!idParam || !idParam.startsWith("extracted_")) return res.status(400).json({ error: "Invalid extracted id" });
+      const cacheKey = idParam;
+      const cached = resolvedExtractedCache.get(cacheKey);
+      if (cached && Date.now() - cached.ts < RESOLVE_TTL_MS) {
+        return res.json({ ok: true, resolvedUrl: cached.resolvedUrl, proxiedUrl: cached.proxiedUrl, cached: true });
+      }
+      const file = await storage.getFileById(idParam);
+      if (!file) return res.status(404).json({ error: "Extracted file not found" });
+      const videoPage = file.videoUrl || file.directDownloadUrl;
+      if (!videoPage) return res.status(400).json({ error: "No source video page available to resolve" });
+      const fetchUrl = `${VERCEL_PROXY_BASE}${encodeURIComponent(videoPage)}`;
+      console.log("[ExtractResolve] Fetching via vercel proxy:", fetchUrl);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2e4);
+      try {
+        const r = await fetch2(fetchUrl, { headers: { "User-Agent": "Mozilla/5.0" }, signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!r.ok) return res.status(502).json({ error: "Failed to fetch source page", status: r.status });
+        const html = await r.text();
+        let resolvedUrl = null;
+        try {
+          const cheerioMod = await import("cheerio");
+          const cheerio = cheerioMod && (cheerioMod.default || cheerioMod);
+          if (!cheerio || typeof cheerio.load !== "function") throw new Error("cheerio not available");
+          const $ = cheerio.load(html);
+          const ld = $('script[type="application/ld+json"]').html();
+          if (ld) {
+            try {
+              const meta = JSON.parse(ld);
+              if (meta && meta.contentUrl) {
+                if (typeof meta.contentUrl === "string") resolvedUrl = meta.contentUrl;
+                else if (Array.isArray(meta.contentUrl) && meta.contentUrl.length > 0) resolvedUrl = meta.contentUrl[0];
+              }
+            } catch (e) {
+            }
+          }
+        } catch (err) {
+          console.warn("[ExtractResolve] Cheerio parse failed", err && err.message);
+        }
+        if (!resolvedUrl) {
+          const mp4Match = html.match(/https?:\/\/[^'"\s>]+\.mp4[^'"\s]*/i);
+          if (mp4Match) resolvedUrl = mp4Match[0];
+        }
+        if (!resolvedUrl) {
+          resolvedUrl = file.directDownloadUrl || null;
+        }
+        if (!resolvedUrl) return res.status(404).json({ error: "Could not resolve mp4 or m3u8 url from page" });
+        const proxiedUrl = `${VERCEL_PROXY_BASE}${encodeURIComponent(resolvedUrl)}`;
+        let resolvedMeta = {};
+        try {
+          let headResp = null;
+          try {
+            headResp = await fetch2(resolvedUrl, { method: "HEAD", headers: { "User-Agent": "Mozilla/5.0" } });
+          } catch (hErr) {
+            try {
+              const r2 = await fetch2(resolvedUrl, { headers: { "User-Agent": "Mozilla/5.0", "Range": "bytes=0-0" } });
+              resolvedMeta = { status: r2.status, contentType: r2.headers.get("content-type"), acceptRanges: r2.headers.get("accept-ranges") };
+            } catch (gErr) {
+              resolvedMeta = { error: gErr && gErr.message || String(gErr) };
+            }
+          }
+          if (headResp) {
+            resolvedMeta = { status: headResp.status, contentType: headResp.headers.get("content-type"), acceptRanges: headResp.headers.get("accept-ranges") };
+          }
+        } catch (metaErr) {
+          resolvedMeta = { error: metaErr && metaErr.message || String(metaErr) };
+        }
+        let proxiedMeta = {};
+        try {
+          try {
+            const pj = await fetch2(proxiedUrl, { method: "HEAD", headers: { "User-Agent": "Mozilla/5.0" } });
+            proxiedMeta = { status: pj.status, contentType: pj.headers.get("content-type"), acceptRanges: pj.headers.get("accept-ranges") };
+          } catch (pErr) {
+            try {
+              const pr = await fetch2(proxiedUrl, { headers: { "User-Agent": "Mozilla/5.0", "Range": "bytes=0-0" } });
+              proxiedMeta = { status: pr.status, contentType: pr.headers.get("content-type"), acceptRanges: pr.headers.get("accept-ranges") };
+            } catch (pErr2) {
+              proxiedMeta = { error: pErr2 && pErr2.message || String(pErr2) };
+            }
+          }
+        } catch (e) {
+          proxiedMeta = { error: e && e.message || String(e) };
+        }
+        const localProxyUrl = `/api/proxy?url=${encodeURIComponent(resolvedUrl)}`;
+        let hostHeader = req.get("host") || "localhost:5000";
+        hostHeader = hostHeader.replace("[::1]", "127.0.0.1").replace("::1", "127.0.0.1");
+        const localProxyAbsolute = `${req.protocol}://${hostHeader}${localProxyUrl}`;
+        let localProxyMeta = {};
+        try {
+          try {
+            const lj = await fetch2(localProxyAbsolute, { method: "HEAD", headers: { "User-Agent": "Mozilla/5.0" } });
+            localProxyMeta = { status: lj.status, contentType: lj.headers.get("content-type"), acceptRanges: lj.headers.get("accept-ranges") };
+          } catch (lErr) {
+            try {
+              const lr = await fetch2(localProxyAbsolute, { headers: { "User-Agent": "Mozilla/5.0", "Range": "bytes=0-0" } });
+              localProxyMeta = { status: lr.status, contentType: lr.headers.get("content-type"), acceptRanges: lr.headers.get("accept-ranges") };
+            } catch (lErr2) {
+              localProxyMeta = { error: lErr2 && lErr2.message || String(lErr2) };
+            }
+          }
+        } catch (le) {
+          localProxyMeta = { error: le && le.message || String(le) };
+        }
+        resolvedExtractedCache.set(cacheKey, { ts: Date.now(), resolvedUrl, proxiedUrl, resolvedMeta, proxiedMeta, localProxyUrl, localProxyMeta });
+        console.log("[ExtractResolve] Resolved URL", { resolvedUrl, proxiedUrl, resolvedMeta, proxiedMeta, localProxyUrl, localProxyMeta });
+        return res.json({ ok: true, resolvedUrl, proxiedUrl, localProxyUrl, resolvedMeta, proxiedMeta, localProxyMeta });
+      } catch (err) {
+        clearTimeout(timeoutId);
+        console.warn("[ExtractResolve] Fetch failed", err && err.message);
+        return res.status(502).json({ error: "Failed to fetch via proxy", details: err && err.message });
+      }
     } catch (error) {
       next(error);
     }
@@ -10730,7 +11481,7 @@ data: {}
         controller.abort();
       }, 3e4);
       try {
-        const response = await fetch(targetUrl, {
+        const response = await fetch2(targetUrl, {
           method: "GET",
           headers: proxyHeaders,
           redirect: "follow",
@@ -10884,6 +11635,7 @@ data: {}
     }
   });
   const httpServer = createServer(app2);
+  const isVercelRuntime2 = process.env.VERCEL === "1" || process.env.VERCEL === "true";
   const wsManager = {
     broadcast: (message) => {
       clients.forEach((client, ws2) => {
@@ -10914,16 +11666,16 @@ data: {}
       const tempThumbnailPath = `${videoPath}.thumb.jpg`;
       ffmpeg2(videoPath).screenshots({
         count: 1,
-        folder: path3.dirname(videoPath),
-        filename: path3.basename(tempThumbnailPath),
+        folder: path4.dirname(videoPath),
+        filename: path4.basename(tempThumbnailPath),
         timemarks: ["10%"],
         // Take thumbnail at 10% of video duration
         size: "300x300"
       }).on("end", async () => {
         try {
-          const fs4 = await import("fs/promises");
-          const thumbnailBuffer = await fs4.readFile(tempThumbnailPath);
-          await fs4.unlink(tempThumbnailPath);
+          const fs6 = await import("fs/promises");
+          const thumbnailBuffer = await fs6.readFile(tempThumbnailPath);
+          await fs6.unlink(tempThumbnailPath);
           resolve(thumbnailBuffer);
         } catch (error) {
           console.warn("Failed to read/cleanup video thumbnail:", error);
@@ -10935,165 +11687,167 @@ data: {}
       });
     });
   }
-  const wss = new WebSocketServer({
-    server: httpServer,
-    path: "/ws",
-    verifyClient: async (info, callback) => {
-      const cookies = parseCookies(info.req.headers.cookie || "");
-      const sessionId = cookies["connect.sid"] || cookies["sessionId"];
-      const userAgent = info.req.headers["user-agent"] || "unknown";
-      const clientIP = info.req.socket.remoteAddress || info.req.connection?.remoteAddress || "unknown";
+  if (!isVercelRuntime2) {
+    const wss = new WebSocketServer({
+      server: httpServer,
+      path: "/ws",
+      verifyClient: async (info, callback) => {
+        const cookies = parseCookies(info.req.headers.cookie || "");
+        const sessionId = cookies["connect.sid"] || cookies["sessionId"];
+        const userAgent = info.req.headers["user-agent"] || "unknown";
+        const clientIP = info.req.socket.remoteAddress || info.req.connection?.remoteAddress || "unknown";
+        const isPingService = userAgent.includes("Forum-Ping-Service");
+        console.log(`\u{1F510} WebSocket authentication attempt:`, {
+          hasSessionId: !!sessionId,
+          userAgent,
+          ip: clientIP,
+          isPingService,
+          timestamp: (/* @__PURE__ */ new Date()).toISOString()
+        });
+        if (sessionId) {
+          try {
+            const sessionStore = sessionSettings.store;
+            if (sessionStore && typeof sessionStore.get === "function") {
+              sessionStore.get(sessionId.replace("s:", "").split(".")[0], (err, session3) => {
+                if (!err && session3 && session3.passport && session3.passport.user) {
+                  info.req.userId = session3.passport.user;
+                  console.log(`\u2705 WebSocket authentication successful for user: ${session3.passport.user}`);
+                  callback(true);
+                  return;
+                }
+                console.log(`\u274C WebSocket authentication failed: Invalid session`);
+                callback(false, 401, "Unauthorized");
+              });
+              return;
+            }
+          } catch (error) {
+            console.error("Session verification error:", error);
+          }
+        }
+        if (isPingService) {
+          console.log(`\u{1F680} Ping service authentication bypassed (no session needed for ping)`);
+          info.req.userId = "ping-service";
+          callback(true);
+          return;
+        }
+        console.log(`\u274C WebSocket authentication failed: No session ID`);
+        callback(false, 401, "Unauthorized");
+      }
+    });
+    wss.on("connection", (ws2, req) => {
+      const client = { ws: ws2 };
+      client.userId = req.userId;
+      const clientIP = req.socket.remoteAddress || req.connection?.remoteAddress || "unknown";
+      const userAgent = req.headers["user-agent"] || "unknown";
       const isPingService = userAgent.includes("Forum-Ping-Service");
-      console.log(`\u{1F510} WebSocket authentication attempt:`, {
-        hasSessionId: !!sessionId,
-        userAgent,
+      console.log(`\u{1F50C} WebSocket client connected:`, {
+        userId: client.userId || "unauthenticated",
         ip: clientIP,
+        userAgent,
         isPingService,
         timestamp: (/* @__PURE__ */ new Date()).toISOString()
       });
-      if (sessionId) {
+      if (isPingService) {
+        console.log("\u{1F680} Ping service connected - keeping server awake!");
+      }
+      clients.set(ws2, client);
+      ws2.on("message", async (data) => {
         try {
-          const sessionStore = sessionSettings.store;
-          if (sessionStore && typeof sessionStore.get === "function") {
-            sessionStore.get(sessionId.replace("s:", "").split(".")[0], (err, session3) => {
-              if (!err && session3 && session3.passport && session3.passport.user) {
-                info.req.userId = session3.passport.user;
-                console.log(`\u2705 WebSocket authentication successful for user: ${session3.passport.user}`);
-                callback(true);
+          const message = JSON.parse(data.toString());
+          console.log(`\u{1F4AC} WebSocket message received:`, {
+            userId: client.userId || "unauthenticated",
+            type: message.type,
+            forumId: message.forumId || "none",
+            hasContent: !!message.content,
+            timestamp: (/* @__PURE__ */ new Date()).toISOString()
+          });
+          if (message.type === "join" && message.forumId) {
+            client.forumId = message.forumId;
+            console.log(`Client joined forum: ${message.forumId}`);
+          }
+          if (message.type === "message" && message.forumId && message.content) {
+            const forum = await storage.getForumById(message.forumId);
+            if (!forum) {
+              ws2.send(JSON.stringify({
+                type: "error",
+                message: "Forum not found"
+              }));
+              return;
+            }
+            if (!forum.isPublic) {
+              const isMember = await storage.isForumMember(forum.id, client.userId);
+              if (!isMember) {
+                ws2.send(JSON.stringify({
+                  type: "error",
+                  message: "Access denied"
+                }));
                 return;
               }
-              console.log(`\u274C WebSocket authentication failed: Invalid session`);
-              callback(false, 401, "Unauthorized");
-            });
-            return;
+            }
+            try {
+              const savedMessage = await storage.createMessage(
+                { forumId: message.forumId, content: message.content },
+                client.userId
+              );
+              clients.forEach((c) => {
+                if (c.forumId === message.forumId && c.ws.readyState === WebSocket2.OPEN) {
+                  c.ws.send(JSON.stringify({
+                    type: "message",
+                    forumId: message.forumId,
+                    message: savedMessage
+                  }));
+                }
+              });
+            } catch (error) {
+              console.error("Failed to create message:", error);
+              if (error?.status === 403) {
+                ws2.send(JSON.stringify({ type: "error", message: error.message || "Forbidden" }));
+                return;
+              }
+              if (error?.code === "23503" && error?.constraint === "messages_forum_id_forums_id_fk") {
+                ws2.send(JSON.stringify({ type: "error", message: "Forum no longer exists" }));
+                return;
+              }
+              ws2.send(JSON.stringify({ type: "error", message: "Failed to send message" }));
+            }
           }
         } catch (error) {
-          console.error("Session verification error:", error);
+          console.error("WebSocket message error:", error);
         }
-      }
-      if (isPingService) {
-        console.log(`\u{1F680} Ping service authentication bypassed (no session needed for ping)`);
-        info.req.userId = "ping-service";
-        callback(true);
-        return;
-      }
-      console.log(`\u274C WebSocket authentication failed: No session ID`);
-      callback(false, 401, "Unauthorized");
-    }
-  });
-  wss.on("connection", (ws2, req) => {
-    const client = { ws: ws2 };
-    client.userId = req.userId;
-    const clientIP = req.socket.remoteAddress || req.connection?.remoteAddress || "unknown";
-    const userAgent = req.headers["user-agent"] || "unknown";
-    const isPingService = userAgent.includes("Forum-Ping-Service");
-    console.log(`\u{1F50C} WebSocket client connected:`, {
-      userId: client.userId || "unauthenticated",
-      ip: clientIP,
-      userAgent,
-      isPingService,
-      timestamp: (/* @__PURE__ */ new Date()).toISOString()
-    });
-    if (isPingService) {
-      console.log("\u{1F680} Ping service connected - keeping server awake!");
-    }
-    clients.set(ws2, client);
-    ws2.on("message", async (data) => {
-      try {
-        const message = JSON.parse(data.toString());
-        console.log(`\u{1F4AC} WebSocket message received:`, {
+      });
+      ws2.on("close", () => {
+        const wasPingService = req.headers["user-agent"]?.includes("Forum-Ping-Service");
+        console.log(`\u{1F50C} WebSocket client disconnected:`, {
           userId: client.userId || "unauthenticated",
-          type: message.type,
-          forumId: message.forumId || "none",
-          hasContent: !!message.content,
+          wasPingService,
           timestamp: (/* @__PURE__ */ new Date()).toISOString()
         });
-        if (message.type === "join" && message.forumId) {
-          client.forumId = message.forumId;
-          console.log(`Client joined forum: ${message.forumId}`);
+        if (wasPingService) {
+          console.log("\u{1F680} Ping service disconnected - server stays awake for next ping!");
         }
-        if (message.type === "message" && message.forumId && message.content) {
-          const forum = await storage.getForumById(message.forumId);
-          if (!forum) {
-            ws2.send(JSON.stringify({
-              type: "error",
-              message: "Forum not found"
-            }));
-            return;
-          }
-          if (!forum.isPublic) {
-            const isMember = await storage.isForumMember(forum.id, client.userId);
-            if (!isMember) {
-              ws2.send(JSON.stringify({
-                type: "error",
-                message: "Access denied"
-              }));
-              return;
-            }
-          }
-          try {
-            const savedMessage = await storage.createMessage(
-              { forumId: message.forumId, content: message.content },
-              client.userId
-            );
-            clients.forEach((c) => {
-              if (c.forumId === message.forumId && c.ws.readyState === WebSocket2.OPEN) {
-                c.ws.send(JSON.stringify({
-                  type: "message",
-                  forumId: message.forumId,
-                  message: savedMessage
-                }));
-              }
-            });
-          } catch (error) {
-            console.error("Failed to create message:", error);
-            if (error?.code === "23503" && error?.constraint === "messages_forum_id_forums_id_fk") {
-              ws2.send(JSON.stringify({
-                type: "error",
-                message: "Forum no longer exists"
-              }));
-              return;
-            }
-            ws2.send(JSON.stringify({
-              type: "error",
-              message: "Failed to send message"
-            }));
-          }
-        }
-      } catch (error) {
-        console.error("WebSocket message error:", error);
-      }
-    });
-    ws2.on("close", () => {
-      const wasPingService = req.headers["user-agent"]?.includes("Forum-Ping-Service");
-      console.log(`\u{1F50C} WebSocket client disconnected:`, {
-        userId: client.userId || "unauthenticated",
-        wasPingService,
-        timestamp: (/* @__PURE__ */ new Date()).toISOString()
+        clients.delete(ws2);
       });
-      if (wasPingService) {
-        console.log("\u{1F680} Ping service disconnected - server stays awake for next ping!");
-      }
-      clients.delete(ws2);
+      ws2.on("error", (error) => {
+        console.error("WebSocket error:", error);
+        clients.delete(ws2);
+      });
     });
-    ws2.on("error", (error) => {
-      console.error("WebSocket error:", error);
-      clients.delete(ws2);
-    });
-  });
+  } else {
+    console.log("WebSocket server disabled for Vercel runtime. Client polling fallback should be used.");
+  }
   return httpServer;
 }
 
 // server/vite.ts
 import express2 from "express";
-import fs2 from "fs";
-import path5 from "path";
+import fs4 from "fs";
+import path6 from "path";
 import { createServer as createViteServer, createLogger } from "vite";
 
 // vite.config.ts
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-import path4 from "path";
+import path5 from "path";
 import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
 var vite_config_default = defineConfig({
   plugins: [
@@ -11110,14 +11864,14 @@ var vite_config_default = defineConfig({
   ],
   resolve: {
     alias: {
-      "@": path4.resolve(import.meta.dirname, "client", "src"),
-      "@shared": path4.resolve(import.meta.dirname, "shared"),
-      "@assets": path4.resolve(import.meta.dirname, "attached_assets")
+      "@": path5.resolve(import.meta.dirname, "client", "src"),
+      "@shared": path5.resolve(import.meta.dirname, "shared"),
+      "@assets": path5.resolve(import.meta.dirname, "attached_assets")
     }
   },
-  root: path4.resolve(import.meta.dirname, "client"),
+  root: path5.resolve(import.meta.dirname, "client"),
   build: {
-    outDir: path4.resolve(import.meta.dirname, "dist/public"),
+    outDir: path5.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true
   },
   server: {
@@ -11169,13 +11923,13 @@ async function setupVite(app2, server) {
   app2.use("*", async (req, res, next) => {
     const url = req.originalUrl;
     try {
-      const clientTemplate = path5.resolve(
+      const clientTemplate = path6.resolve(
         import.meta.dirname,
         "..",
         "client",
         "index.html"
       );
-      let template = await fs2.promises.readFile(clientTemplate, "utf-8");
+      let template = await fs4.promises.readFile(clientTemplate, "utf-8");
       template = template.replace(
         `src="/src/main.tsx"`,
         `src="/src/main.tsx?v=${nanoid()}"`
@@ -11189,26 +11943,26 @@ async function setupVite(app2, server) {
   });
 }
 function serveStatic(app2) {
-  const distPath = path5.resolve(import.meta.dirname, "public");
-  if (!fs2.existsSync(distPath)) {
+  const distPath = path6.resolve(import.meta.dirname, "public");
+  if (!fs4.existsSync(distPath)) {
     throw new Error(
       `Could not find the build directory: ${distPath}, make sure to build the client first`
     );
   }
   app2.use(express2.static(distPath));
   app2.use("*", (_req, res) => {
-    res.sendFile(path5.resolve(distPath, "index.html"));
+    res.sendFile(path6.resolve(distPath, "index.html"));
   });
 }
 
 // server/port-manager.ts
 import net from "net";
-import fs3 from "fs";
-import path6 from "path";
+import fs5 from "fs";
+import path7 from "path";
 var PortManager = class _PortManager {
   PORT_RANGE_START = 5e3;
   PORT_RANGE_END = 6e3;
-  LOCK_FILE_DIR = path6.join(process.cwd(), ".ports");
+  LOCK_FILE_DIR = path7.join(process.cwd(), ".ports");
   LOCK_FILE_PREFIX = "port-";
   CLEANUP_INTERVAL = 3e4;
   // 30 seconds
@@ -11222,8 +11976,8 @@ var PortManager = class _PortManager {
     this.startCleanup();
   }
   ensureLockDirectory() {
-    if (!fs3.existsSync(this.LOCK_FILE_DIR)) {
-      fs3.mkdirSync(this.LOCK_FILE_DIR, { recursive: true });
+    if (!fs5.existsSync(this.LOCK_FILE_DIR)) {
+      fs5.mkdirSync(this.LOCK_FILE_DIR, { recursive: true });
     }
   }
   startCleanup() {
@@ -11234,26 +11988,26 @@ var PortManager = class _PortManager {
   }
   cleanupStaleLocks() {
     try {
-      const files2 = fs3.readdirSync(this.LOCK_FILE_DIR);
+      const files2 = fs5.readdirSync(this.LOCK_FILE_DIR);
       const now = Date.now();
       for (const file of files2) {
         if (!file.startsWith(this.LOCK_FILE_PREFIX)) continue;
-        const filePath = path6.join(this.LOCK_FILE_DIR, file);
+        const filePath = path7.join(this.LOCK_FILE_DIR, file);
         try {
-          const content = fs3.readFileSync(filePath, "utf8");
+          const content = fs5.readFileSync(filePath, "utf8");
           const portInfo = JSON.parse(content);
           const lockAge = now - new Date(portInfo.timestamp).getTime();
           if (lockAge > this.PORT_TIMEOUT) {
-            fs3.unlinkSync(filePath);
+            fs5.unlinkSync(filePath);
             console.log(`\u{1F9F9} Cleaned up stale port lock: ${portInfo.port}`);
             continue;
           }
           if (!this.isProcessRunning(portInfo.processId)) {
-            fs3.unlinkSync(filePath);
+            fs5.unlinkSync(filePath);
             console.log(`\u{1F9F9} Cleaned up orphaned port lock: ${portInfo.port} (PID ${portInfo.processId})`);
           }
         } catch (error) {
-          fs3.unlinkSync(filePath);
+          fs5.unlinkSync(filePath);
         }
       }
     } catch (error) {
@@ -11286,24 +12040,24 @@ var PortManager = class _PortManager {
     });
   }
   isPortLocked(port) {
-    const lockFile = path6.join(this.LOCK_FILE_DIR, `${this.LOCK_FILE_PREFIX}${port}`);
-    return fs3.existsSync(lockFile);
+    const lockFile = path7.join(this.LOCK_FILE_DIR, `${this.LOCK_FILE_PREFIX}${port}`);
+    return fs5.existsSync(lockFile);
   }
   lockPort(port, type) {
-    const lockFile = path6.join(this.LOCK_FILE_DIR, `${this.LOCK_FILE_PREFIX}${port}`);
+    const lockFile = path7.join(this.LOCK_FILE_DIR, `${this.LOCK_FILE_PREFIX}${port}`);
     const portInfo = {
       port,
       processId: process.pid,
       timestamp: /* @__PURE__ */ new Date(),
       type
     };
-    fs3.writeFileSync(lockFile, JSON.stringify(portInfo, null, 2));
+    fs5.writeFileSync(lockFile, JSON.stringify(portInfo, null, 2));
     this.assignedPort = port;
     this.lockFile = lockFile;
   }
   unlockPort() {
-    if (this.lockFile && fs3.existsSync(this.lockFile)) {
-      fs3.unlinkSync(this.lockFile);
+    if (this.lockFile && fs5.existsSync(this.lockFile)) {
+      fs5.unlinkSync(this.lockFile);
       this.lockFile = null;
     }
     this.assignedPort = null;
@@ -11348,12 +12102,12 @@ var PortManager = class _PortManager {
   }
   getActivePorts() {
     try {
-      const files2 = fs3.readdirSync(this.LOCK_FILE_DIR);
+      const files2 = fs5.readdirSync(this.LOCK_FILE_DIR);
       const ports = [];
       for (const file of files2) {
         if (!file.startsWith(this.LOCK_FILE_PREFIX)) continue;
         try {
-          const content = fs3.readFileSync(path6.join(this.LOCK_FILE_DIR, file), "utf8");
+          const content = fs5.readFileSync(path7.join(this.LOCK_FILE_DIR, file), "utf8");
           const portInfo = JSON.parse(content);
           if (this.isProcessRunning(portInfo.processId)) {
             ports.push(portInfo);
@@ -11451,16 +12205,19 @@ init_cluster_manager();
 init_load_balancer();
 dotenv2.config();
 var __filename = fileURLToPath(import.meta.url);
-var __dirname = path7.dirname(__filename);
+var __dirname = path8.dirname(__filename);
 var app = express3();
-memoryOptimizer.on("memoryExhaustion", (data) => {
-  console.error("\u{1F6A8} Memory exhaustion detected:", data);
-  keepAliveService.emergencyPause(12e4);
-});
-memoryOptimizer.on("memoryWarning", (data) => {
-  console.warn("\u26A0\uFE0F Memory warning:", data);
-  keepAliveService.emergencyPause(6e4);
-});
+var isVercelRuntime = process.env.VERCEL === "1" || process.env.VERCEL === "true";
+if (!isVercelRuntime) {
+  memoryOptimizer.on("memoryExhaustion", (data) => {
+    console.error("\u{1F6A8} Memory exhaustion detected:", data);
+    keepAliveService.emergencyPause(12e4);
+  });
+  memoryOptimizer.on("memoryWarning", (data) => {
+    console.warn("\u26A0\uFE0F Memory warning:", data);
+    keepAliveService.emergencyPause(6e4);
+  });
+}
 app.use(express3.json({
   verify: (req, _res, buf) => {
     req.rawBody = buf;
@@ -11489,7 +12246,7 @@ app.use((req, res, next) => {
 });
 app.use((req, res, next) => {
   const start = Date.now();
-  const path8 = req.path;
+  const path9 = req.path;
   let capturedJsonResponse = void 0;
   const originalResJson = res.json;
   res.json = function(bodyJson, ...args) {
@@ -11498,8 +12255,8 @@ app.use((req, res, next) => {
   };
   res.on("finish", () => {
     const duration = Date.now() - start;
-    if (path8.startsWith("/api")) {
-      let logLine = `${req.method} ${path8} ${res.statusCode} in ${duration}ms`;
+    if (path9.startsWith("/api")) {
+      let logLine = `${req.method} ${path9} ${res.statusCode} in ${duration}ms`;
       if (capturedJsonResponse) {
         logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
       }
@@ -11511,101 +12268,128 @@ app.use((req, res, next) => {
   });
   next();
 });
-(async () => {
-  const server = await registerRoutes(app);
-  app.use((err, req, res, _next) => {
-    const status = err.status || err.statusCode || 500;
-    const message = err.message || "Internal Server Error";
-    console.error("\u{1F534} Detailed API Error:", {
-      message: err.message,
-      stack: err.stack,
-      code: err.code,
-      errno: err.errno,
-      syscall: err.syscall,
-      hostname: err.hostname,
-      url: req.url,
-      method: req.method,
-      user: req.user?.id,
-      userAgent: req.headers["user-agent"],
-      ip: req.ip,
-      timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-      process: {
-        pid: process.pid,
-        memory: process.memoryUsage(),
-        uptime: process.uptime()
-      },
-      errorType: err.constructor.name
+var isInitialized = false;
+var initPromise = null;
+var initApp = async () => {
+  if (isInitialized) return;
+  if (initPromise) return initPromise;
+  initPromise = (async () => {
+    const server = await registerRoutes(app);
+    app.use((err, req, res, _next) => {
+      const status = err.status || err.statusCode || 500;
+      const message = err.message || "Internal Server Error";
+      console.error("\u{1F534} Detailed API Error:", {
+        message: err.message,
+        stack: err.stack,
+        code: err.code,
+        errno: err.errno,
+        syscall: err.syscall,
+        hostname: err.hostname,
+        url: req.url,
+        method: req.method,
+        user: req.user?.id,
+        userAgent: req.headers["user-agent"],
+        ip: req.ip,
+        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+        process: {
+          pid: process.pid,
+          memory: process.memoryUsage(),
+          uptime: process.uptime()
+        },
+        errorType: err.constructor.name
+      });
+      res.status(status).json({ message });
     });
-    res.status(status).json({ message });
-  });
-  if (app.get("env") === "development") {
-    await setupVite(app, server);
-  } else {
-    serveStatic(app);
-  }
-  let port;
-  if (process.env.NODE_ENV === "production" && process.env.PORT) {
-    port = parseInt(process.env.PORT, 10);
-  } else {
-    const preferredPort = parseInt(process.env.PORT || "5000", 10);
-    port = await portManager.assignPort("main", preferredPort);
-  }
-  const hasWorkers = process.env.WORKER_SERVERS || process.env.UPLOAD_WORKERS || process.env.CHAT_WORKERS;
-  if (hasWorkers) {
-    app.use("/api", loadBalancer.getLoadBalanceMiddleware());
-    log("\u{1F310} Load balancer enabled for worker servers");
-  }
-  app.use("/hls", (req, res, next) => {
-    res.header("Access-Control-Allow-Origin", "*");
-    res.header("Access-Control-Allow-Methods", "GET");
-    next();
-  }, express3.static(path7.join(__dirname, "storage/hls")));
-  server.listen({
-    port,
-    host: "0.0.0.0"
-    // Changed from "localhost" to "0.0.0.0" for Render
-  }, () => {
-    log(`\u{1F680} Server running on port ${port}`);
-    const keepAliveEnabled = process.env.KEEP_ALIVE_ENABLED === "true" || process.env.KEEP_ALIVE_ENABLED !== "false" && (process.env.NODE_ENV === "production" || process.env.RENDER_EXTERNAL_URL);
-    if (keepAliveEnabled) {
-      setTimeout(() => {
-        keepAliveService.start(port);
-      }, 15e3);
-      log(`\u{1F504} Keep-alive service will start with self-ping on port ${port}`);
+    if (app.get("env") === "development") {
+      await setupVite(app, server);
     } else {
-      log("\u{1F504} Keep-alive service disabled");
+      serveStatic(app);
     }
-    if (process.env.NODE_ENV === "development") {
-      log(`\u{1F4CA} Memory monitoring active (limit: ${memoryOptimizer.getMemoryStats().limit}MB)`);
-      const clusterMetrics = clusterManager.getClusterMetrics();
-      if (clusterMetrics.totalServers > 0) {
-        log(`\u{1F310} Cluster: ${clusterMetrics.healthyServers}/${clusterMetrics.totalServers} workers healthy`);
+    let port;
+    if (process.env.NODE_ENV === "production" && process.env.PORT) {
+      port = parseInt(process.env.PORT, 10);
+    } else {
+      const preferredPort = parseInt(process.env.PORT || "5000", 10);
+      port = await portManager.assignPort("main", preferredPort);
+    }
+    const hasWorkers = process.env.WORKER_SERVERS || process.env.UPLOAD_WORKERS || process.env.CHAT_WORKERS;
+    if (hasWorkers && !isVercelRuntime) {
+      app.use("/api", loadBalancer.getLoadBalanceMiddleware());
+      log("\u{1F310} Load balancer enabled for worker servers");
+    }
+    app.use("/hls", (req, res, next) => {
+      res.header("Access-Control-Allow-Origin", "*");
+      res.header("Access-Control-Allow-Methods", "GET");
+      next();
+    }, express3.static(path8.join(__dirname, "storage/hls")));
+    if (!isVercelRuntime) {
+      server.listen({
+        port,
+        host: "0.0.0.0"
+        // Changed from "localhost" to "0.0.0.0" for Render
+      }, () => {
+        log(`\u{1F680} Server running on port ${port}`);
+        const keepAliveEnabled = process.env.KEEP_ALIVE_ENABLED === "true" || process.env.KEEP_ALIVE_ENABLED !== "false" && (process.env.NODE_ENV === "production" || process.env.RENDER_EXTERNAL_URL);
+        if (keepAliveEnabled && !isVercelRuntime) {
+          setTimeout(() => {
+            keepAliveService.start(port);
+          }, 15e3);
+          log(`\u{1F504} Keep-alive service will start with self-ping on port ${port}`);
+        } else if (isVercelRuntime) {
+          log("\u{1F504} Keep-alive service disabled for Vercel runtime");
+        } else {
+          log("\u{1F504} Keep-alive service disabled");
+        }
+        if (process.env.NODE_ENV === "development") {
+          log(`\u{1F4CA} Memory monitoring active (limit: ${memoryOptimizer.getMemoryStats().limit}MB)`);
+          const clusterMetrics = clusterManager.getClusterMetrics();
+          if (clusterMetrics.totalServers > 0) {
+            log(`\u{1F310} Cluster: ${clusterMetrics.healthyServers}/${clusterMetrics.totalServers} workers healthy`);
+          }
+        }
+      });
+      process.on("SIGTERM", async () => {
+        console.log("\u{1F50C} Received SIGTERM, shutting down gracefully...");
+        await gracefulShutdown();
+      });
+      process.on("SIGINT", async () => {
+        console.log("\u{1F50C} Received SIGINT, shutting down gracefully...");
+        await gracefulShutdown();
+      });
+    }
+    async function gracefulShutdown() {
+      try {
+        server.close(() => {
+          console.log("\u2705 HTTP server closed");
+        });
+        if (!isVercelRuntime) {
+          keepAliveService.stop();
+          loadBalancer.shutdown();
+          clusterManager.shutdown();
+          memoryOptimizer.shutdown();
+          portManager.shutdown();
+        }
+        console.log("\u2705 Graceful shutdown complete");
+        process.exit(0);
+      } catch (error) {
+        console.error("\u274C Error during shutdown:", error);
+        process.exit(1);
       }
     }
-  });
-  process.on("SIGTERM", async () => {
-    console.log("\u{1F50C} Received SIGTERM, shutting down gracefully...");
-    await gracefulShutdown();
-  });
-  process.on("SIGINT", async () => {
-    console.log("\u{1F50C} Received SIGINT, shutting down gracefully...");
-    await gracefulShutdown();
-  });
-  async function gracefulShutdown() {
-    try {
-      server.close(() => {
-        console.log("\u2705 HTTP server closed");
-      });
-      keepAliveService.stop();
-      loadBalancer.shutdown();
-      clusterManager.shutdown();
-      memoryOptimizer.shutdown();
-      portManager.shutdown();
-      console.log("\u2705 Graceful shutdown complete");
-      process.exit(0);
-    } catch (error) {
-      console.error("\u274C Error during shutdown:", error);
-      process.exit(1);
-    }
+    isInitialized = true;
+  })();
+  try {
+    await initPromise;
+  } catch (error) {
+    isInitialized = false;
+    initPromise = null;
+    throw error;
   }
-})();
+};
+if (!isVercelRuntime) {
+  initApp().catch(console.error);
+}
+export {
+  app,
+  initApp
+};

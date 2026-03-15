@@ -34,6 +34,7 @@ interface UnifiedTimelineProps {
   messages: MessageWithUser[];
   files: FileWithChunks[];
   forumId: string;
+  canManageTags?: boolean;
   scrollToMessage?: string | null;
   scrollToFile?: string | null;
   ws?: WebSocket | null;
@@ -67,7 +68,8 @@ function TimelineItem({
   formatFileSize,
   renderMessageContent,
   handlePreview,
-  forumId
+  forumId,
+  canManageTags
 }: {
   item: TimelineItem;
   index: number;
@@ -89,6 +91,7 @@ function TimelineItem({
   renderMessageContent: (content: string) => JSX.Element;
   handlePreview: (file: FileWithChunks) => void;
   forumId: string;
+  canManageTags: boolean;
 }) {
   if (item.type === "message") {
     const message = item.data as MessageWithUser;
@@ -145,6 +148,8 @@ function TimelineItem({
             messageId={message.id}
             editingTags={editingTags}
             setEditingTags={setEditingTags}
+            forumId={forumId}
+            canManageTags={canManageTags}
           />
           
           <CommentsSection
@@ -324,6 +329,8 @@ function TimelineItem({
             editingTags={editingTags}
             setEditingTags={setEditingTags}
             file={file}
+            forumId={forumId}
+            canManageTags={canManageTags}
           />
           
           {/* Comments section - only for non-extracted files */}
@@ -352,19 +359,20 @@ function TagList({ tags }: { tags: Tag[] }) {
   const remaining = tags.length - limit;
 
   return (
-    <div className="flex flex-wrap gap-1">
+    <div className="flex flex-wrap gap-1 max-w-full">
       {displayTags.map((tag) => (
         <Badge
           key={tag.id}
           variant="outline"
-          className="text-xs"
+          className="text-xs truncate max-w-[120px] shrink-0"
+          title={tag.name}
           style={{ borderColor: tag.color || "#6b7280", color: tag.color || "#6b7280" }}
         >
           <span
-            className="w-1.5 h-1.5 rounded-full mr-1"
+            className="w-1.5 h-1.5 rounded-full mr-1 flex-shrink-0"
             style={{ backgroundColor: tag.color || "#6b7280" }}
           />
-          {tag.name}
+          <span className="truncate">{tag.name}</span>
         </Badge>
       ))}
       {remaining > 0 && (
@@ -380,11 +388,15 @@ function TagList({ tags }: { tags: Tag[] }) {
 function MessageTagsSection({ 
   messageId, 
   editingTags, 
-  setEditingTags 
+  setEditingTags,
+  forumId,
+  canManageTags,
 }: { 
   messageId: string; 
   editingTags: string | null; 
-  setEditingTags: (id: string | null) => void; 
+  setEditingTags: (id: string | null) => void;
+  forumId: string;
+  canManageTags: boolean;
 }) {
   const {
     selectedTags,
@@ -392,11 +404,11 @@ function MessageTagsSection({
     handleTagsChange,
     handleCreateTag,
     isUpdating,
-  } = useEntityTagManager('message', messageId);
+  } = useEntityTagManager('message', messageId, { forumId });
 
   return (
     <div className="flex items-center gap-2 mt-1">
-      {editingTags === `message-${messageId}` ? (
+      {canManageTags && editingTags === `message-${messageId}` ? (
         <div className="mt-2 p-2 border rounded-lg bg-muted/50 w-full">
           <TagInput
             selectedTags={selectedTags}
@@ -419,17 +431,19 @@ function MessageTagsSection({
         </div>
       ) : (
         <>
-          <div className="flex items-center gap-2 mt-2 min-h-6">
+          <div className="flex items-center gap-2 mt-2 min-h-6 max-w-full overflow-hidden">
             {selectedTags.length > 0 && <TagList tags={selectedTags} />}
-            <Button
-            variant="ghost"
-            size="sm"
-            className="h-6 px-2 text-xs"
-            onClick={() => setEditingTags(`message-${messageId}`)}
-          >
-            <TagIcon className="h-3 w-3 mr-1" />
-            {selectedTags.length > 0 ? 'Edit' : 'Tag'}
-          </Button>
+            {canManageTags && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 px-2 text-xs flex-shrink-0"
+                onClick={() => setEditingTags(`message-${messageId}`)}
+              >
+                <TagIcon className="h-3 w-3 mr-1" />
+                {selectedTags.length > 0 ? 'Edit' : 'Tag'}
+              </Button>
+            )}
           </div>
         </>
       )}
@@ -442,12 +456,16 @@ function FileTagsSection({
   fileId, 
   editingTags, 
   setEditingTags,
-  file 
+  file,
+  forumId,
+  canManageTags,
 }: { 
   fileId: string; 
   editingTags: string | null; 
   setEditingTags: (id: string | null) => void;
   file: FileWithChunks;
+  forumId: string;
+  canManageTags: boolean;
 }) {
   const {
     selectedTags,
@@ -455,7 +473,7 @@ function FileTagsSection({
     handleTagsChange,
     handleCreateTag,
     isUpdating,
-  } = useEntityTagManager('file', fileId);
+  } = useEntityTagManager('file', fileId, { forumId });
 
   const isExtractedFile = fileId.startsWith('extracted_');
   const [tagInput, setTagInput] = useState<string>("");
@@ -483,7 +501,7 @@ function FileTagsSection({
     // Handle extracted files with string-based tags
     return (
       <div className="flex items-center gap-2 mt-1">
-        {editingTags === `file-${fileId}` ? (
+        {canManageTags && editingTags === `file-${fileId}` ? (
           <div className="mt-2 p-2 border rounded-lg bg-muted/50 w-full">
             <div className="flex gap-2 mb-2">
               <Input
@@ -550,19 +568,20 @@ function FileTagsSection({
                   const displayTags = tags.slice(0, limit);
                   const remaining = tags.length - limit;
                   return (
-                    <div className="flex flex-wrap gap-1">
+                    <div className="flex flex-wrap gap-1 max-w-full">
                       {displayTags.map((tag: string, index: number) => (
                         <Badge
                           key={index}
                           variant="secondary"
-                          className="text-xs"
+                          className="text-xs truncate max-w-[200px]"
+                          title={tag.trim()}
                           style={{ backgroundColor: "#6b7280", color: "white" }}
                         >
-                          {tag.trim()}
+                          <span className="truncate">{tag.trim()}</span>
                         </Badge>
                       ))}
                       {remaining > 0 && (
-                        <Badge variant="outline" className="text-xs text-muted-foreground">
+                        <Badge variant="outline" className="text-xs text-muted-foreground whitespace-nowrap">
                           +{remaining}...
                         </Badge>
                       )}
@@ -570,15 +589,16 @@ function FileTagsSection({
                   );
                 })()
               )}
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-6 px-2 text-xs"
-              onClick={() => setEditingTags(`file-${fileId}`)}
-            >
-              
-              {((file as any).tags || []).length > 0 ? 'Edit Tags' : 'Add Tags'}
-            </Button>
+            {canManageTags && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 px-2 text-xs"
+                onClick={() => setEditingTags(`file-${fileId}`)}
+              >
+                {((file as any).tags || []).length > 0 ? 'Edit Tags' : 'Add Tags'}
+              </Button>
+            )}
           </>
         )}
       </div>
@@ -588,7 +608,7 @@ function FileTagsSection({
   // Handle regular files with Tag objects
   return (
     <div className="flex items-center gap-2 mt-1">
-      {editingTags === `file-${fileId}` ? (
+      {canManageTags && editingTags === `file-${fileId}` ? (
         <div className="mt-2 p-2 border rounded-lg bg-muted/50 w-full">
           <TagInput
             selectedTags={selectedTags}
@@ -611,24 +631,26 @@ function FileTagsSection({
           </div>
         </div>
       ) : (
-        <div className="flex items-center gap-2 mt-2 min-h-6">
+        <div className="flex items-center gap-2 mt-2 min-h-6 max-w-full overflow-hidden">
           {selectedTags.length > 0 && <TagList tags={selectedTags} />}
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-6 px-2 text-xs"
-            onClick={() => setEditingTags(`file-${fileId}`)}
-          >
-            <TagIcon className="h-3 w-3 mr-1" />
-            {selectedTags.length > 0 ? 'Edit' : 'Tag'}
-          </Button>
+          {canManageTags && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 px-2 text-xs flex-shrink-0"
+              onClick={() => setEditingTags(`file-${fileId}`)}
+            >
+              <TagIcon className="h-3 w-3 mr-1" />
+              {selectedTags.length > 0 ? 'Edit' : 'Tag'}
+            </Button>
+          )}
         </div>
       )}
     </div>
   );
 }
 
-export function UnifiedTimeline({ messages, files, forumId, scrollToMessage, scrollToFile, ws, uploadProgress, onLoadMore, hasMore, isLoadingMore, totalFiles, extractedCount }: UnifiedTimelineProps) {
+export function UnifiedTimeline({ messages, files, forumId, canManageTags = false, scrollToMessage, scrollToFile, ws, uploadProgress, onLoadMore, hasMore, isLoadingMore, totalFiles, extractedCount }: UnifiedTimelineProps) {
   // totalFiles is passed in via props destructuring
   // it may be undefined/null if not provided
   
@@ -863,7 +885,7 @@ export function UnifiedTimeline({ messages, files, forumId, scrollToMessage, scr
       // Add code block
       const codeContent = match[1];
       parts.push(
-        <pre key={`code-${match.index}`} className="bg-gray-100 dark:bg-gray-800 rounded p-3 mt-2 mb-2 overflow-x-auto text-sm font-mono border max-w-full whitespace-pre-wrap break-words">
+        <pre key={`code-${match.index}`} className="bg-gray-100 dark:bg-gray-800 rounded p-3 mt-2 mb-2 overflow-x-auto overflow-y-auto max-h-96 text-sm font-mono border max-w-full whitespace-pre-wrap break-words">
           <code className="whitespace-pre-wrap break-words">{codeContent}</code>
         </pre>
       );
@@ -1101,6 +1123,7 @@ export function UnifiedTimeline({ messages, files, forumId, scrollToMessage, scr
             renderMessageContent={renderMessageContent}
             handlePreview={handlePreview}
             forumId={forumId}
+            canManageTags={canManageTags}
           />
         ))}
         <div ref={timelineEndRef} />

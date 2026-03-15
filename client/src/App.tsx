@@ -4,9 +4,9 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AuthProvider } from "@/hooks/use-auth";
-import { usePingService } from "@/hooks/use-ping-service";
 import { useTabCleanup } from "@/hooks/use-tab-cleanup";
 import { ProtectedRoute } from "@/lib/protected-route";
+import { WakeupLoadingOverlay } from "@/components/wakeup-loading-overlay";
 import NotFound from "@/pages/not-found";
 import AuthPage from "@/pages/auth-page";
 import HomePage from "@/pages/home-page";
@@ -36,15 +36,6 @@ function Router() {
 }
 
 function App() {
-  // Start ping service to keep server awake on Render
-  usePingService({
-    interval: 10000, // Ping every 10 seconds
-    enabled: true,
-    onError: (error) => {
-      console.warn('🚨 Keep-alive ping failed:', error.message);
-    }
-  });
-
   // Handle tab cleanup to reset storage when tab is closed
   useTabCleanup({
     enabled: true,
@@ -58,6 +49,7 @@ function App() {
       <AuthProvider>
         <TooltipProvider>
           <Toaster />
+          <WakeupLoadingOverlay />
           <Router />
         </TooltipProvider>
       </AuthProvider>

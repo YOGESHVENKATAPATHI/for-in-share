@@ -14,23 +14,18 @@ import { portManager } from "./port-manager";
 import { memoryOptimizer } from "./memory-optimizer";
 import { clusterManager } from "./cluster-manager";
 import { loadBalancer } from "./load-balancer";
-import { keepAliveService } from "./keep-alive";
 
 const app = express();
 const isVercelRuntime = process.env.VERCEL === '1' || process.env.VERCEL === 'true';
 
-// Initialize memory optimization with keep-alive integration
+// Initialize memory optimization event hooks
 if (!isVercelRuntime) {
   memoryOptimizer.on('memoryExhaustion', (data) => {
     console.error('🚨 Memory exhaustion detected:', data);
-    // Emergency pause keep-alive service to reduce memory pressure
-    keepAliveService.emergencyPause(120000); // 2 minutes pause
   });
 
   memoryOptimizer.on('memoryWarning', (data) => {
     console.warn('⚠️ Memory warning:', data);
-    // Temporary pause keep-alive during memory warnings
-    keepAliveService.emergencyPause(60000); // 1 minute pause
   });
 }
 
@@ -184,23 +179,7 @@ export const initApp = async () => {
       }, () => {
         log(`🚀 Server running on port ${port}`);
       
-      // Start keep-alive service for Render-like persistent deployments.
-      // Vercel serverless does not support long-running keep-alive loops.
-        const keepAliveEnabled = process.env.KEEP_ALIVE_ENABLED === 'true' || 
-                   (process.env.KEEP_ALIVE_ENABLED !== 'false' && 
-              (process.env.NODE_ENV === 'production' || process.env.RENDER_EXTERNAL_URL));
-      
-        if (keepAliveEnabled && !isVercelRuntime) {
-          // Start keep-alive service after longer delay to ensure server is stable
-          setTimeout(() => {
-            keepAliveService.start(port);
-          }, 15000); // Start after 15 seconds to let server fully stabilize
-          log(`🔄 Keep-alive service will start with self-ping on port ${port}`);
-        } else if (isVercelRuntime) {
-          log('🔄 Keep-alive service disabled for Vercel runtime');
-        } else {
-          log('🔄 Keep-alive service disabled');
-        }
+        log('ℹ️ Keep-alive ping system disabled; service wakes on demand');
       
         if (process.env.NODE_ENV === 'development') {
           log(`📊 Memory monitoring active (limit: ${memoryOptimizer.getMemoryStats().limit}MB)`);
@@ -234,7 +213,6 @@ export const initApp = async () => {
 
         // Shutdown components
         if (!isVercelRuntime) {
-          keepAliveService.stop();
           loadBalancer.shutdown();
           clusterManager.shutdown();
           memoryOptimizer.shutdown();

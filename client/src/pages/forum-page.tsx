@@ -45,23 +45,24 @@ function TagList({ tags }: { tags?: TagItem[] }) {
   const remaining = Math.max(0, safeTags.length - limit);
 
   return (
-    <div className="flex flex-wrap gap-1 items-center min-h-6">
+    <div className="flex flex-wrap gap-1 items-center min-h-6 max-w-full">
       {displayTags.map((tag) => (
         <Badge
           key={tag.id}
           variant="outline"
-          className="text-xs"
+          className="text-xs truncate max-w-[120px] shrink-0"
+          title={tag.name}
           style={{ borderColor: tag.color || "#6b7280", color: tag.color || "#6b7280" }}
         >
           <span
-            className="w-1.5 h-1.5 rounded-full mr-1"
+            className="w-1.5 h-1.5 rounded-full mr-1 flex-shrink-0"
             style={{ backgroundColor: tag.color || "#6b7280" }}
           />
-          {tag.name}
+          <span className="truncate">{tag.name}</span>
         </Badge>
       ))}
       {remaining > 0 && (
-        <Badge variant="outline" className="text-xs text-muted-foreground">
+        <Badge variant="outline" className="text-xs text-muted-foreground whitespace-nowrap">
           +{remaining}...
         </Badge>
       )}
@@ -1188,6 +1189,7 @@ export default function ForumPage() {
                   messages={searchFilteredMessages}
                   files={searchFilteredFiles}
                   forumId={forumId!}
+                  canManageTags={forum?.creatorId === user?.id}
                   scrollToMessage={scrollToMessage}
                   scrollToFile={scrollToFile}
                   ws={ws}

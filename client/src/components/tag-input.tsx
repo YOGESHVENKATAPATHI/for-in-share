@@ -119,14 +119,14 @@ export function TagInput({
             <Badge
               key={tag.id}
               variant="secondary"
-              className="flex items-center gap-1"
+              className="flex items-center gap-1 max-w-[150px]"
               style={{ backgroundColor: tag.color + '20', borderColor: tag.color }}
             >
               <span
-                className="w-2 h-2 rounded-full"
+                className="w-2 h-2 rounded-full shrink-0"
                 style={{ backgroundColor: tag.color }}
               />
-              {tag.name}
+              <span className="truncate">{tag.name}</span>
               {!disableRemoval && (
                 <button
                   onClick={() => handleRemoveTag(tag.id)}

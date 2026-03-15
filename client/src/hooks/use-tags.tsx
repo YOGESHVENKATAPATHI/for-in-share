@@ -11,12 +11,16 @@ export interface Tag {
 }
 
 // Fetch all available tags
-export function useTags(options?: { includeExtracted?: boolean }) {
+export function useTags(options?: { includeExtracted?: boolean; forumId?: string }) {
   const includeExtracted = options?.includeExtracted === true;
+  const forumId = options?.forumId;
   return useQuery({
-    queryKey: ['tags', { includeExtracted }],
+    queryKey: ['tags', { includeExtracted, forumId }],
     queryFn: async (): Promise<Tag[]> => {
-      const url = `/api/tags${includeExtracted ? '?includeExtracted=true' : ''}`;
+      const query = new URLSearchParams();
+      if (includeExtracted) query.set('includeExtracted', 'true');
+      if (forumId) query.set('forumId', forumId);
+      const url = `/api/tags${query.toString() ? `?${query.toString()}` : ''}`;
       const response = await fetch(url);
       if (!response.ok) {
         throw new Error('Failed to fetch tags');
@@ -77,7 +81,7 @@ export function useCreateTag() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: async (tagData: { name: string; description?: string; color?: string }): Promise<Tag> => {
+    mutationFn: async (tagData: { name: string; description?: string; color?: string; forumId: string }): Promise<Tag> => {
       const response = await fetch('/api/tags', {
         method: 'POST',
         headers: {
@@ -207,9 +211,10 @@ export function useRemoveTag() {
 }
 
 // Hook for managing tags on an entity (combines fetching and mutations)
-export function useEntityTagManager(entityType: string, entityId: string, options?: { includeExtracted?: boolean }) {
+export function useEntityTagManager(entityType: string, entityId: string, options?: { includeExtracted?: boolean; forumId?: string }) {
   const { data: entityTags = [], isLoading } = useEntityTags(entityType, entityId);
-  const { data: allTags = [] } = useTags({ includeExtracted: options?.includeExtracted });
+  const effectiveForumId = entityType === 'forum' ? entityId : options?.forumId;
+  const { data: allTags = [] } = useTags({ includeExtracted: options?.includeExtracted, forumId: effectiveForumId });
 
   const [selectedTags, setSelectedTags] = useState<Tag[]>(entityTags);
 
@@ -260,7 +265,14 @@ export function useEntityTagManager(entityType: string, entityId: string, option
   };
 
   const handleCreateTag = async (tagData: { name: string; description?: string; color?: string }) => {
-    return await createTagMutation.mutateAsync(tagData);
+    if (!effectiveForumId) {
+      throw new Error('forumId is required to create tags');
+    }
+
+    return await createTagMutation.mutateAsync({
+      ...tagData,
+      forumId: effectiveForumId,
+    });
   };
 
   return {

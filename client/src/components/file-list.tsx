@@ -600,15 +600,16 @@ export function FileList({ files, isLoading, forumId, onPreview, ws, isLoadingMo
             </CardContent>
           </Card>
           {file.extractedTags && file.extractedTags.length > 0 && (
-            <div className="flex flex-wrap gap-1 mt-2">
+            <div className="flex flex-wrap gap-1 mt-2 max-w-full">
               {file.extractedTags.map((tag, index) => (
                 <Badge
                   key={index}
                   variant="secondary"
-                  className="text-xs"
+                  className="text-xs truncate max-w-[200px]"
+                  title={tag}
                   style={{ backgroundColor: "#6b7280", color: "white" }}
                 >
-                  {tag}
+                  <span className="truncate">{tag}</span>
                 </Badge>
               ))}
             </div>

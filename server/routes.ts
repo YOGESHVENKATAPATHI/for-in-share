@@ -12,11 +12,10 @@ import { setupAuth } from "./auth";
 import { storage } from "./storage";
 import { dropboxManager } from "./dropbox-manager";
 import { dbManager } from "./db";
-import { insertForumSchema, insertMessageSchema, insertCommentSchema, insertAccessRequestSchema, users, forums, forumMembers, messages, files, fileTags, tags, messageTags, forumTags } from "@shared/schema";
+import { insertForumSchema, insertMessageSchema, insertCommentSchema, insertAccessRequestSchema, users, forums, forumMembers, messages, files, fileTags, tags, messageTags, forumTags, adminUsers } from "@shared/schema";
 import { fromZodError } from "zod-validation-error";
 import fetch from "node-fetch";
 import fs from 'fs';
-import { keepAliveService } from "./keep-alive";
 import { eq, and, or, ilike, exists, isNotNull, sql } from "drizzle-orm";
 import { distributedChunkManager } from "./distributed-chunk-manager";
 // Transcoding removed - using direct streaming only
@@ -81,35 +80,6 @@ function setupWebSocketRegistration(wss) {
 export async function registerRoutes(app: Express): Promise<Server> {
   // HLS serving removed - using direct streaming only
 
-  // Add keep-alive endpoints BEFORE session setup to avoid database issues
-  // These endpoints should work even if the session table doesn't exist
-  app.get("/api/ping", (req, res) => {
-    const isKeepAlive = req.get('X-Keep-Alive') === 'true';
-    const activityCounter = req.get('X-Activity-Counter');
-    
-    const memoryUsage = process.memoryUsage();
-    const response = { 
-      status: "alive", 
-      timestamp: new Date().toISOString(),
-      uptime: Math.floor(process.uptime()),
-      memory: {
-        rss: Math.round(memoryUsage.rss / 1024 / 1024), // MB
-        heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024), // MB
-        external: Math.round(memoryUsage.external / 1024 / 1024) // MB
-      },
-      keepAlive: {
-        isKeepAliveRequest: isKeepAlive,
-        activityCounter: activityCounter ? parseInt(activityCounter) : undefined
-      }
-    };
-    
-    if (isKeepAlive && activityCounter) {
-      console.log(`🔄 Keep-alive ping #${activityCounter} received - server staying active`);
-    }
-    
-    res.json(response);
-  });
-
   app.get("/health", (req, res) => {
     const memoryUsage = process.memoryUsage();
     
@@ -121,12 +91,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
         rss: Math.round(memoryUsage.rss / 1024 / 1024),
         heap: Math.round(memoryUsage.heapUsed / 1024 / 1024),
         percentage: Math.round((memoryUsage.rss / (512 * 1024 * 1024)) * 100) // Assuming 512MB limit
-      },
-      renderPrevention: {
-        enabled: true,
-        maxInactivitySeconds: 50,
-        keepAliveIntervalSeconds: 35,
-        status: "protected"
       }
     });
   });
@@ -178,6 +142,38 @@ export async function registerRoutes(app: Express): Promise<Server> {
     next();
   };
 
+  const isAdminUser = async (user: any): Promise<boolean> => {
+    if (!user?.username && !user?.email) {
+      return false;
+    }
+
+    const instances = dbManager.getAllInstances();
+    for (const instance of instances) {
+      try {
+        const admin = await instance.db
+          .select({ id: adminUsers.id })
+          .from(adminUsers)
+          .where(and(
+            eq(adminUsers.isActive, true),
+            or(
+              user.username ? eq(adminUsers.username, user.username) : sql`false`,
+              user.email ? eq(adminUsers.email, user.email) : sql`false`
+            )
+          ))
+          .limit(1)
+          .then((rows) => rows[0]);
+
+        if (admin) {
+          return true;
+        }
+      } catch (error) {
+        console.error(`Error checking admin user in shard ${instance.id}:`, error);
+      }
+    }
+
+    return false;
+  };
+
   // Debug endpoint to check authentication and user session
   app.get("/api/debug/auth", async (req, res) => {
     try {
@@ -221,22 +217,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json({ message: 'Test user created successfully', user: { id: user.id, username: user.username } });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
-    }
-  });
-
-  // Keep-alive service status endpoint
-  app.get("/api/keep-alive/status", async (req, res) => {
-    try {
-      const status = keepAliveService.getStatus();
-      res.json({
-        ...status,
-        timestamp: new Date().toISOString()
-      });
-    } catch (error: any) {
-      res.status(500).json({
-        error: "Failed to get keep-alive status",
-        message: error.message
-      });
     }
   });
 
@@ -3725,8 +3705,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Tags routes
   app.get("/api/tags", optionalAuth, async (req, res, next) => {
     try {
-      const includeExtracted = String(req.query.includeExtracted || 'false') === 'true';
-      const tags = await storage.getTags(includeExtracted);
+      const forumId = typeof req.query.forumId === 'string' && req.query.forumId.trim().length > 0
+        ? req.query.forumId.trim()
+        : undefined;
+      const tags = await storage.getTags(false, forumId);
       res.json(tags);
     } catch (error) {
       next(error);
@@ -3735,15 +3717,30 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post("/api/tags", requireAuth, async (req, res, next) => {
     try {
-      const { name, description, color } = req.body;
+      const { name, description, color, forumId } = req.body;
       if (!name || typeof name !== 'string' || name.trim().length === 0) {
         return res.status(400).send("Tag name is required");
+      }
+
+      if (!forumId || typeof forumId !== 'string' || forumId.trim().length === 0) {
+        return res.status(400).send("forumId is required");
+      }
+
+      const forum = await storage.getForumById(forumId.trim());
+      if (!forum) {
+        return res.status(404).send("Forum not found");
+      }
+
+      if (forum.creatorId !== req.user!.id) {
+        return res.status(403).send("Only forum creator can create tags");
       }
 
       const tag = await storage.createTag({
         name: name.trim(),
         description: description?.trim(),
-        color: color || "#6b7280"
+        color: color || "#6b7280",
+        forumId: forum.id,
+        createdBy: req.user!.id,
       });
 
       // Broadcast tag creation to all connected clients
@@ -3781,6 +3778,27 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).send("Tag name is required");
       }
 
+      const existingTag = await storage.getTagById(req.params.id);
+      if (!existingTag) {
+        return res.status(404).send("Tag not found");
+      }
+
+      const admin = await isAdminUser(req.user);
+      if (!admin) {
+        if (!existingTag.forumId) {
+          return res.status(403).send("Only admin can update legacy tags without forum ownership");
+        }
+
+        const forum = await storage.getForumById(existingTag.forumId);
+        if (!forum) {
+          return res.status(404).send("Forum not found");
+        }
+
+        if (forum.creatorId !== req.user!.id) {
+          return res.status(403).send("Only forum creator can update tags");
+        }
+      }
+
       const tag = await storage.updateTag(req.params.id, {
         name: name.trim(),
         description: description?.trim(),
@@ -3812,6 +3830,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const tag = await storage.getTagById(req.params.id);
       if (!tag) {
         return res.status(404).send("Tag not found");
+      }
+
+      const admin = await isAdminUser(req.user);
+      if (!admin) {
+        if (!tag.forumId) {
+          return res.status(403).send("Only admin can delete legacy tags without forum ownership");
+        }
+
+        const forum = await storage.getForumById(tag.forumId);
+        if (!forum) {
+          return res.status(404).send("Forum not found");
+        }
+
+        if (forum.creatorId !== req.user!.id) {
+          return res.status(403).send("Only forum creator can delete tags");
+        }
       }
 
       await storage.deleteTag(req.params.id);
@@ -3922,26 +3956,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).send("Could not determine forum ID");
       }
 
-      // For forums, check if user is the creator
-      if (entityType === 'forum') {
-        const forum = await storage.getForumById(forumId);
-        if (forum?.creatorId !== req.user!.id) {
-          return res.status(403).send("Only forum creator can manage forum tags");
-        }
+      const forum = await storage.getForumById(forumId);
+      if (!forum) {
+        return res.status(404).send("Forum not found");
       }
 
-      // Check forum access for non-forum entities
-      if (entityType !== 'forum') {
-        const forum = await storage.getForumById(forumId);
-        if (!forum) {
-          return res.status(404).send("Forum not found");
+      if (forum.creatorId !== req.user!.id) {
+        return res.status(403).send("Only forum creator can assign tags");
+      }
+
+      for (const tagId of tagIds) {
+        const tag = await storage.getTagById(tagId);
+        if (!tag) {
+          return res.status(404).send(`Tag not found: ${tagId}`);
         }
 
-        if (!forum.isPublic) {
-          const isMember = await storage.isForumMember(forum.id, req.user!.id);
-          if (!isMember) {
-            return res.status(403).send("Access denied");
-          }
+        if (tag.forumId && tag.forumId !== forumId) {
+          return res.status(403).send("Cannot assign tags created for another forum");
         }
       }
 
@@ -4005,27 +4036,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).send("Could not determine forum ID");
       }
 
-      // For forums, check if user is the creator
-      if (entityType === 'forum') {
-        const forum = await storage.getForumById(forumId);
-        if (forum?.creatorId !== req.user!.id) {
-          return res.status(403).send("Only forum creator can manage forum tags");
-        }
+      const forum = await storage.getForumById(forumId);
+      if (!forum) {
+        return res.status(404).send("Forum not found");
       }
 
-      // Check forum access for non-forum entities
-      if (entityType !== 'forum') {
-        const forum = await storage.getForumById(forumId);
-        if (!forum) {
-          return res.status(404).send("Forum not found");
-        }
+      if (forum.creatorId !== req.user!.id) {
+        return res.status(403).send("Only forum creator can unassign tags");
+      }
 
-        if (!forum.isPublic) {
-          const isMember = await storage.isForumMember(forum.id, req.user!.id);
-          if (!isMember) {
-            return res.status(403).send("Access denied");
-          }
-        }
+      const tag = await storage.getTagById(tagId);
+      if (!tag) {
+        return res.status(404).send("Tag not found");
+      }
+
+      if (tag.forumId && tag.forumId !== forumId) {
+        return res.status(403).send("Cannot unassign tags created for another forum");
       }
 
       // Remove tag assignment
@@ -4068,48 +4094,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       console.log(`[API] Search request: query="${query}", user=${req.user?.username || 'anonymous'}`);
-      console.log(`[API] Starting comprehensive search across extracted databases and local databases...`);
+      console.log(`[API] Starting search across local databases...`);
       const startTime = Date.now();
       
       const forumId = req.query.forumId as string | undefined;
       const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit || '20'), 10)));
       const offset = Math.max(0, parseInt(String(req.query.offset || '0'), 10));
 
-      // Perform local search and extracted search, then merge and paginate files
+      // Perform local search
       const localResults = await storage.searchEntities(query, req.user?.id, forumId);
-      const extractedFiles = await storage.searchExtractedFiles(query, forumId);
 
-      // Merge files, dedupe by id, sort by uploadedAt desc
-      const allFilesMap: Record<string, any> = {};
-      for (const f of [...localResults.files, ...extractedFiles]) {
-        allFilesMap[f.id] = f;
-      }
-      const mergedFiles = Object.values(allFilesMap).sort((a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+      // Sort files by uploadedAt desc
+      const sortedFiles = localResults.files.sort((a: any, b: any) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
 
-      const totalFiles = mergedFiles.length;
-      const paginatedFiles = mergedFiles.slice(offset, offset + limit);
+      const totalFiles = sortedFiles.length;
+      const paginatedFiles = sortedFiles.slice(offset, offset + limit);
 
       const duration = Date.now() - startTime;
       console.log(`[API] Search completed: query="${query}", totalFiles:${totalFiles}, returned:${paginatedFiles.length}, duration=${duration}ms`);
 
       res.json({ forums: localResults.forums, messages: localResults.messages, files: paginatedFiles, totalFiles });
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  // Extracted-only search (live updates for extracted DBs)
-  app.get("/api/search/extracted", optionalAuth, async (req, res, next) => {
-    try {
-      const query = req.query.q as string;
-      if (!query) return res.status(400).send('Query is required');
-      const forumId = req.query.forumId as string | undefined;
-      const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit || '20'), 10)));
-      const offset = Math.max(0, parseInt(String(req.query.offset || '0'), 10));
-      const results = await storage.searchExtractedFiles(query, forumId);
-      const totalFiles = results.length;
-      const files = results.sort((a,b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()).slice(offset, offset + limit);
-      res.json({ files, totalFiles });
     } catch (error) {
       next(error);
     }
@@ -4380,122 +4384,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // SSE extracted search stream
-  app.get('/api/search/extracted/stream', optionalAuth, async (req, res, next) => {
-    try {
-      const query = String(req.query.q || '');
-      if (!query) return res.status(400).send('Query required');
-      const forumId = req.query.forumId as string | undefined;
-      const userId = req.user?.id;
 
-      // Check access if forumId provided
-      if (forumId) {
-        const forum = await storage.getForumById(forumId);
-        if (!forum) return res.status(404).send('Forum not found');
-        if (!forum.isPublic) {
-          if (!req.isAuthenticated?.() || !req.user) return res.sendStatus(401);
-          const isMember = await storage.isForumMember(forumId, req.user.id);
-          if (!isMember) return res.status(403).send('Access denied');
-        }
-      }
-
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      res.flushHeaders?.();
-
-      // Stream extracted DBs progressively by querying each Neon DB and streaming matching rows as they are found
-      const dbUrls = await (await import('./neon-manager')).default.getNeonDbUrls();
-
-      const searchTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
-      const batchSize = 5; // small batch for progressive fetching and streaming
-      // Keep running count of extracted matches so clients can show totals while streaming
-      let extractedStreamedCount = 0;
-      for (let i = 0; i < dbUrls.length; i++) {
-        const dbU = dbUrls[i];
-        const dbIdentifier = dbU.split('@')[1]?.split('.')[0] || `db${i+1}`;
-        try {
-          const { Client } = await import('pg');
-          const client = new Client({ connectionString: dbU });
-          await client.connect();
-          const tableCheck = await client.query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings');`);
-          if (!tableCheck.rows[0].exists) { await client.end(); continue; }
-          // Stream rows in small batches to avoid loading everything into memory
-          let offset = 0;
-          let done = false;
-          while (!done) {
-            const { rows } = await client.query(`SELECT id, name, video, image, url, uploaddate, tags, uploadedby, size, type, last_updated FROM video_mappings ORDER BY last_updated DESC LIMIT ${batchSize} OFFSET ${offset}`);
-            if (!rows || rows.length === 0) { done = true; break; }
-
-          const adminUser = await storage.getUserByUsername('admin');
-          const forums = await storage.getForums();
-          let xmasterForum = forums.find((f: any) => f.name === 'Xmaster');
-          if (!xmasterForum && adminUser) {
-            try {
-              xmasterForum = await storage.createForum({ name: 'Xmaster', description: 'Extracted videos from external sources', isPublic: true, metaTitle: 'Xmaster' }, adminUser.id);
-            } catch (e) {
-              console.warn('Failed to create Xmaster forum', e);
-            }
-          }
-
-            for (const row of rows) {
-            const searchableText = [row.name || '', row.tags || '', row.uploadedby || '', row.video || '', row.url || ''].join(' ').toLowerCase();
-            if (searchTerms.every(term => searchableText.includes(term))) {
-              const file = {
-                id: `extracted_${i}_${row.id}`,
-                forumId: xmasterForum?.id || 'xmaster-forum-id',
-                userId: adminUser?.id || 'xmaster-user-id',
-                fileName: row.name || 'Unknown Video',
-                fileSize: parseInt(row.size) || 0,
-                mimeType: row.type || 'video/mp4',
-                thumbnail: row.image || null,
-                adminThumbnailUrl: row.image || null,
-                metaTitle: row.name || null,
-                uploadedAt: new Date(row.uploaddate || row.last_updated || Date.now()),
-                isAdminCreated: true,
-                adminCreatedBy: 'XMaster',
-                user: {
-                  id: adminUser?.id || 'xmaster-user-id',
-                  username: 'XMaster',
-                  email: adminUser?.email || 'xmaster@example.com',
-                  displayName: 'XMaster',
-                  avatar: adminUser?.avatar || null,
-                  createdAt: adminUser?.createdAt || new Date(),
-                  isAdmin: true,
-                  isActive: true,
-                },
-                forum: xmasterForum
-              };
-              res.write(`data: ${JSON.stringify({ type: 'file', data: file })}\n\n`);
-              extractedStreamedCount++;
-              await new Promise(r => setTimeout(r, 5));
-            }
-          }
-            // After processing the batch, emit updated count for extracted source
-            if (rows.length > 0) {
-              res.write(`event: count\ndata: ${JSON.stringify({ source: 'extracted', count: extractedStreamedCount })}\n\n`);
-            }
-            offset += batchSize;
-            if (rows.length < batchSize) done = true;
-          }
-          await client.end();
-        } catch (err) {
-          console.warn('Search extracted stream db error', dbIdentifier, err.message || err);
-        }
-      }
-      // Final extracted count (ensure client has final count)
-      res.write(`event: count\ndata: ${JSON.stringify({ source: 'extracted', count: extractedStreamedCount })}\n\n`);
-      res.write(`event: done\ndata: {}\n\n`);
-      res.end();
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  // Resolve extracted item live via Vercel proxy (uses cache)
-  const resolvedExtractedCache = new Map(); // key: extractedId, value: { proxiedUrl, resolvedUrl, ts }
-  const RESOLVE_TTL_MS = 60 * 1000; // 60s cache
-  const VERCEL_PROXY_BASE = process.env.VERCEL_PROXY_BASE || 'https://webproxier-ov6et6gpw-ogeshs-projects.vercel.app/api/proxy?url=';
 
   app.get('/api/extracted/:id/resolve', optionalAuth, async (req, res, next) => {
     try {

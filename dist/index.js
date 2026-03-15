@@ -14,389 +14,6 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
-// server/neon-manager.ts
-var neon_manager_exports = {};
-__export(neon_manager_exports, {
-  default: () => neon_manager_default,
-  getDbSizeBytes: () => getDbSizeBytes,
-  getMainExtractedDb: () => getMainExtractedDb,
-  getNeonDbUrls: () => getNeonDbUrls,
-  importVideoMappingsFromJson: () => importVideoMappingsFromJson,
-  importVideoMappingsIntoAllNeons: () => importVideoMappingsIntoAllNeons,
-  importVideoMappingsToAll: () => importVideoMappingsToAll,
-  replicateExtractedVideoMappings: () => replicateExtractedVideoMappings,
-  setMainExtractedDb: () => setMainExtractedDb,
-  tryReplicateToAnotherNeon: () => tryReplicateToAnotherNeon
-});
-import { Client } from "pg";
-import fetch from "node-fetch";
-import fs from "fs";
-import path from "path";
-async function getNeonDbUrls(opts) {
-  const includeEnv = opts?.includeEnv !== false;
-  const includeBackup = opts?.includeBackup !== false;
-  const includeAirtable = opts?.includeAirtable !== false;
-  const includeHardcoded = opts?.includeHardcoded !== false;
-  const sources = {};
-  let urls = [];
-  if (includeBackup) {
-    const backupStrings = process.env.BACKUP_STRINGS || "";
-    if (backupStrings) {
-      const backupUrls = backupStrings.split(",").map((u) => u.trim()).filter(Boolean);
-      urls = urls.concat(backupUrls.filter((u) => !urls.includes(u)));
-      backupUrls.forEach((u) => sources[u] = "backup");
-      console.log("[NeonManager] Using BACKUP_STRINGS entries:", backupUrls.length);
-    }
-  }
-  if (includeEnv) {
-    const dbUrl = process.env.DATABASE_URL || "";
-    if (dbUrl) {
-      const envUrls = dbUrl.split(",").map((u) => u.trim()).filter(Boolean);
-      urls = urls.concat(envUrls.filter((u) => !urls.includes(u)));
-      envUrls.forEach((u) => sources[u] = "env");
-      console.log("[NeonManager] process.env.DATABASE_URL entries:", envUrls.length);
-    }
-  }
-  const airtableApiKey = process.env.AIRTABLE_API_KEY;
-  const airtableBase = process.env.AIRTABLE_BASE_ID;
-  const airtableTable = process.env.AIRTABLE_TABLE_ID;
-  const skipAirtable = String(process.env.SKIP_AIRTABLE || "").toLowerCase() === "true";
-  if (includeAirtable && !skipAirtable && airtableApiKey && airtableBase && airtableTable) {
-    try {
-      const res = await fetch(`https://api.airtable.com/v0/${airtableBase}/${airtableTable}`, {
-        headers: { Authorization: `Bearer ${airtableApiKey}` }
-      });
-      if (res.ok) {
-        const json = await res.json();
-        const airtableUrls = (json.records || []).map((r) => (r.fields?.connectionstring || "").trim()).filter(Boolean);
-        console.log("[NeonManager] Airtable returned", airtableUrls.length, "urls");
-        airtableUrls.filter((u) => !urls.includes(u)).forEach((u) => {
-          urls.push(u);
-          sources[u] = "airtable";
-        });
-      }
-    } catch (err) {
-      console.warn("Failed to fetch Neon connection strings from Airtable", err);
-    }
-  }
-  const hardcodedExtractedDb = process.env.HARDCODED_EXTRACTED_DB || "";
-  if (includeHardcoded && hardcodedExtractedDb && !urls.includes(hardcodedExtractedDb)) {
-    urls.push(hardcodedExtractedDb);
-    sources[hardcodedExtractedDb] = "hardcoded";
-  }
-  console.log("[NeonManager] Final urls count:", urls.length);
-  console.log("[NeonManager] Url sources sample:", Object.entries(sources).slice(0, 10));
-  try {
-    const { promises: fsp } = await import("fs");
-    const metaPath = path.resolve(process.cwd(), "meta", "extracted_main.json");
-    if (fs.existsSync(metaPath)) {
-      const raw = await fsp.readFile(metaPath, "utf8");
-      const json = JSON.parse(raw);
-      const mainConn = json && json.main || "";
-      if (mainConn && !urls.includes(mainConn)) {
-        urls.unshift(mainConn);
-      } else if (mainConn && urls.includes(mainConn)) {
-        urls.splice(urls.indexOf(mainConn), 1);
-        urls.unshift(mainConn);
-      }
-    }
-  } catch (err) {
-  }
-  return urls;
-}
-async function importVideoMappingsToAll(jsonFilePath, options) {
-  const results = [];
-  const urls = await getNeonDbUrls();
-  for (const url of urls) {
-    try {
-      console.log(`[NeonManager] Importing to ${url}`);
-      const res = await importVideoMappingsFromJson(url, jsonFilePath);
-      results.push({ url, ok: true, res });
-    } catch (err) {
-      console.warn(`[NeonManager] Import failed for ${url}`, err?.message || err);
-      results.push({ url, ok: false, err: String(err?.message || err) });
-    }
-  }
-  return results;
-}
-async function replicateExtractedVideoMappings(sourceConn, targetConn) {
-  const src = new Client({ connectionString: sourceConn });
-  const dst = new Client({ connectionString: targetConn });
-  await src.connect();
-  await dst.connect();
-  try {
-    const tableCheck = await dst.query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings');`);
-    if (!tableCheck.rows[0].exists) {
-      return { inserted: 0, skipped: 0 };
-    }
-    const targetRows = await dst.query("SELECT id FROM video_mappings");
-    const targetIds = new Set(targetRows.rows.map((r) => String(r.id)));
-    const batchSize = 200;
-    let offset = 0;
-    let inserted = 0;
-    let skipped = 0;
-    while (true) {
-      const res = await src.query(`SELECT * FROM video_mappings ORDER BY id LIMIT ${batchSize} OFFSET ${offset}`);
-      if (!res.rows || res.rows.length === 0) break;
-      for (const row of res.rows) {
-        const id = String(row.id);
-        if (targetIds.has(id)) {
-          skipped++;
-          continue;
-        }
-        const cols = Object.keys(row).map((c) => '"' + c + '"').join(", ");
-        const vals = Object.values(row);
-        const placeholders = vals.map((_, i) => `$${i + 1}`).join(", ");
-        try {
-          await dst.query(`INSERT INTO video_mappings (${cols}) VALUES (${placeholders}) ON CONFLICT DO NOTHING`, vals);
-          inserted++;
-          targetIds.add(id);
-        } catch (e) {
-          console.warn("Failed to insert row into target extracted DB", e.message || e);
-        }
-      }
-      if (res.rows.length < batchSize) break;
-      offset += batchSize;
-    }
-    return { inserted, skipped };
-  } finally {
-    await src.end();
-    await dst.end();
-  }
-}
-async function tryReplicateToAnotherNeon(thresholdBytes = 0) {
-  const urls = await getNeonDbUrls();
-  if (urls.length < 2) {
-    console.warn("No additional Neon DBs available to replicate to");
-    return;
-  }
-  const primary = urls[0];
-  const target = urls.find((u) => u !== primary) || urls[1];
-  try {
-    const result = await replicateExtractedVideoMappings(primary, target);
-    console.log(`[NeonManager] Replication done inserted=${result.inserted} skipped=${result.skipped}`);
-  } catch (err) {
-    console.warn("Neon replication failed", err);
-  }
-}
-async function getDbSizeBytes(connString) {
-  try {
-    const { Client: Client2 } = await import("pg");
-    const client = new Client2({ connectionString: connString });
-    await client.connect();
-    const res = await client.query(`SELECT pg_database_size(current_database()) as size`);
-    await client.end();
-    if (!res.rows || res.rows.length === 0) return null;
-    return Number(res.rows[0].size || 0);
-  } catch (err) {
-    console.warn("Failed to get DB size for Neon server", err?.message || err);
-    return null;
-  }
-}
-async function getMainExtractedDb() {
-  const envVal = process.env.HARDCODED_EXTRACTED_DB || null;
-  if (envVal) return envVal;
-  try {
-    const { promises: fsp } = await import("fs");
-    const metaPath = path.resolve(process.cwd(), "meta", "extracted_main.json");
-    if (!fs.existsSync(metaPath)) return null;
-    const raw = await fsp.readFile(metaPath, "utf8");
-    const json = JSON.parse(raw);
-    return json && json.main || null;
-  } catch (err) {
-    return null;
-  }
-}
-async function setMainExtractedDb(connString) {
-  try {
-    const { promises: fsp } = await import("fs");
-    const metaDir = path.resolve(process.cwd(), "meta");
-    if (!fs.existsSync(metaDir)) await fsp.mkdir(metaDir, { recursive: true });
-    const metaPath = path.resolve(metaDir, "extracted_main.json");
-    await fsp.writeFile(metaPath, JSON.stringify({ main: connString }), "utf8");
-  } catch (err) {
-    console.warn("Failed to persist main extracted DB selection", err?.message || err);
-  }
-}
-async function importVideoMappingsFromJson(targetConn, jsonFilePath) {
-  const { promises: fsp } = await import("fs");
-  const path9 = jsonFilePath;
-  const content = await fsp.readFile(path9, "utf-8");
-  let rows;
-  try {
-    rows = JSON.parse(content);
-    if (!Array.isArray(rows)) throw new Error("JSON root is not an array");
-  } catch (err) {
-    console.warn("Failed to parse json file for import", err?.message || err);
-    throw err;
-  }
-  const dst = new Client({ connectionString: targetConn });
-  await dst.connect();
-  try {
-    const tableCheck = await dst.query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings');`);
-    if (!tableCheck.rows[0].exists) {
-      console.log("[NeonManager] video_mappings table not found in target DB; attempting to create minimal schema");
-      try {
-        await dst.query(`CREATE TABLE IF NOT EXISTS video_mappings (
-          id varchar(255) PRIMARY KEY,
-          name text,
-          video text,
-          m3u8 text,
-          image text,
-          thumbnail text,
-          url text,
-          uploaddate timestamp,
-          tags text,
-          uploadedby text,
-          size bigint,
-          type text,
-          duration numeric,
-          last_updated timestamp,
-          meta jsonb
-        );`);
-        console.log("[NeonManager] Created minimal video_mappings table in target DB");
-      } catch (err) {
-        console.warn("[NeonManager] Failed to create video_mappings table in target DB", err?.message || err);
-        return { inserted: 0, skipped: rows.length || 0 };
-      }
-    }
-    const batchSize = 200;
-    let inserted = 0;
-    let skipped = 0;
-    const colRes = await dst.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'video_mappings'`);
-    const allowedCols = new Set(colRes.rows.map((r) => r.column_name));
-    for (let i = 0; i < rows.length; i += batchSize) {
-      const batch = rows.slice(i, i + batchSize);
-      for (const row of batch) {
-        const filteredKeys = Object.keys(row).filter((k) => allowedCols.has(k));
-        if (filteredKeys.length === 0) {
-          skipped++;
-          continue;
-        }
-        const cols = filteredKeys.map((c) => '"' + c + '"').join(", ");
-        const vals = filteredKeys.map((k) => row[k]);
-        const placeholders = vals.map((_, idx) => `$${idx + 1}`).join(", ");
-        try {
-          const res = await dst.query(`INSERT INTO video_mappings (${cols}) VALUES (${placeholders}) ON CONFLICT DO NOTHING`, vals);
-          if (typeof res.rowCount === "number") {
-            if (res.rowCount > 0) inserted += res.rowCount;
-            else skipped++;
-          } else {
-            inserted++;
-          }
-        } catch (err) {
-          skipped++;
-          console.warn("Failed to insert row from json into target extracted DB", err?.message || err);
-        }
-      }
-    }
-    return { inserted, skipped };
-  } finally {
-    await dst.end();
-  }
-}
-async function importVideoMappingsIntoAllNeons(jsonFilePath, opts) {
-  const results = [];
-  const { promises: fsp } = await import("fs");
-  const raw = await fsp.readFile(jsonFilePath, "utf8");
-  const rows = JSON.parse(raw);
-  if (!Array.isArray(rows)) throw new Error("JSON root is not array");
-  console.log("[NeonManager] importVideoMappingsIntoAllNeons: rows length:", rows.length);
-  const urls = await getNeonDbUrls();
-  console.log("[NeonManager] importVideoMappingsIntoAllNeons: will process urls count:", urls.length);
-  for (const url of urls) {
-    console.log(`[NeonManager] importVideoMappingsIntoAllNeons: processing ${url}`);
-    try {
-      const client = new Client({ connectionString: url });
-      await client.connect();
-      const tableCheck = await client.query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings');`);
-      if (!tableCheck.rows[0].exists) {
-        await client.query(`CREATE TABLE IF NOT EXISTS video_mappings (
-          id varchar(255) PRIMARY KEY,
-          name text,
-          video text,
-          m3u8 text,
-          image text,
-          thumbnail text,
-          url text,
-          uploaddate timestamp,
-          tags text,
-          uploadedby text,
-          size bigint,
-          type text,
-          duration numeric,
-          last_updated timestamp,
-          meta jsonb
-        );`);
-      }
-      const allIds = rows.map((r) => String(r.id));
-      const chunkSize = 1e3;
-      const existing = /* @__PURE__ */ new Set();
-      for (let i = 0; i < allIds.length; i += chunkSize) {
-        const chunk = allIds.slice(i, i + chunkSize);
-        const placeholders = chunk.map((_, idx) => `$${idx + 1}`).join(", ");
-        const res = await client.query(`SELECT id FROM video_mappings WHERE id IN (${placeholders})`, chunk);
-        for (const r of res.rows) existing.add(String(r.id));
-      }
-      const colRes = await client.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'video_mappings'`);
-      const allowedCols = new Set(colRes.rows.map((r) => r.column_name));
-      let inserted = 0;
-      let skipped = 0;
-      for (let i = 0; i < rows.length; i += chunkSize) {
-        const batch = rows.slice(i, i + chunkSize);
-        const toInsert = batch.filter((r) => !existing.has(String(r.id)));
-        if (toInsert.length === 0) {
-          skipped += batch.length;
-          continue;
-        }
-        const cols = Object.keys(toInsert[0]).filter((k) => allowedCols.has(k));
-        const colList = cols.map((c) => '"' + c + '"').join(", ");
-        const values = [];
-        const valuePlaceholders = [];
-        toInsert.forEach((row, rowIdx) => {
-          const rowPlaceholders = cols.map((_, colIdx) => `$${rowIdx * cols.length + colIdx + 1}`);
-          valuePlaceholders.push(`(${rowPlaceholders.join(",")})`);
-          cols.forEach((c) => values.push(row[c]));
-        });
-        const query = `INSERT INTO video_mappings (${colList}) VALUES ${valuePlaceholders.join(",")} ON CONFLICT DO NOTHING`;
-        try {
-          const r = await client.query(query, values);
-          if (typeof r.rowCount === "number") inserted += r.rowCount;
-          else inserted += toInsert.length;
-        } catch (err) {
-          console.warn(`[NeonManager] Failed inserting batch to ${url}`, err?.message || err);
-          for (const row of toInsert) {
-            const cols2 = Object.keys(row);
-            const cols2List = cols2.map((c) => '"' + c + '"').join(", ");
-            const vals = Object.values(row);
-            const ph = vals.map((_, idx) => `$${idx + 1}`).join(", ");
-            try {
-              await client.query(`INSERT INTO video_mappings (${cols2List}) VALUES (${ph}) ON CONFLICT DO NOTHING`, vals);
-              inserted++;
-            } catch (e) {
-              skipped++;
-            }
-          }
-        }
-      }
-      await client.end();
-      results.push({ url, inserted, skipped });
-      console.log(`[NeonManager] importVideoMappingsIntoAllNeons: done ${url} inserted=${inserted} skipped=${skipped}`);
-    } catch (err) {
-      console.warn(`[NeonManager] Import to ${url} failed`, err?.message || err);
-      if (!opts?.ignoreErrors) results.push({ url, inserted: 0, skipped: 0, error: String(err?.message || err) });
-      else results.push({ url, inserted: 0, skipped: 0, error: String(err?.message || err) });
-    }
-  }
-  return { perDb: results };
-}
-var neon_manager_default;
-var init_neon_manager = __esm({
-  "server/neon-manager.ts"() {
-    neon_manager_default = { getNeonDbUrls, replicateExtractedVideoMappings, tryReplicateToAnotherNeon, getDbSizeBytes, importVideoMappingsFromJson, importVideoMappingsIntoAllNeons, getMainExtractedDb, setMainExtractedDb };
-  }
-});
-
 // shared/schema.ts
 var schema_exports = {};
 __export(schema_exports, {
@@ -469,7 +86,7 @@ var init_schema = __esm({
     });
     adminLogs = pgTable("admin_logs", {
       id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-      adminId: varchar("admin_id").notNull().references(() => adminUsers.id, { onDelete: "cascade" }),
+      adminId: varchar("admin_id").notNull(),
       action: text("action").notNull(),
       // create_file, delete_file, create_message, delete_message, etc.
       entityType: text("entity_type").notNull(),
@@ -485,7 +102,7 @@ var init_schema = __esm({
       name: text("name").notNull(),
       description: text("description"),
       isPublic: boolean("is_public").notNull().default(true),
-      creatorId: varchar("creator_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+      creatorId: varchar("creator_id").notNull(),
       metaTitle: text("meta_title"),
       metaDescription: text("meta_description"),
       keywords: text("keywords"),
@@ -496,26 +113,26 @@ var init_schema = __esm({
     });
     forumMembers = pgTable("forum_members", {
       id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-      forumId: varchar("forum_id").notNull().references(() => forums.id, { onDelete: "cascade" }),
-      userId: varchar("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+      forumId: varchar("forum_id").notNull(),
+      userId: varchar("user_id").notNull(),
       role: text("role").notNull().default("member"),
       // member, moderator, admin
       joinedAt: timestamp("joined_at").notNull().defaultNow()
     });
     accessRequests = pgTable("access_requests", {
       id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-      forumId: varchar("forum_id").notNull().references(() => forums.id, { onDelete: "cascade" }),
-      userId: varchar("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+      forumId: varchar("forum_id").notNull(),
+      userId: varchar("user_id").notNull(),
       status: text("status").notNull().default("pending"),
       // pending, approved, rejected
       requestedAt: timestamp("requested_at").notNull().defaultNow(),
       resolvedAt: timestamp("resolved_at"),
-      resolvedBy: varchar("resolved_by").references(() => users.id)
+      resolvedBy: varchar("resolved_by")
     });
     messages = pgTable("messages", {
       id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-      forumId: varchar("forum_id").notNull().references(() => forums.id, { onDelete: "cascade" }),
-      userId: varchar("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+      forumId: varchar("forum_id").notNull(),
+      userId: varchar("user_id").notNull(),
       content: text("content").notNull(),
       createdAt: timestamp("created_at").notNull().defaultNow(),
       // Admin tracking fields
@@ -527,7 +144,7 @@ var init_schema = __esm({
     });
     comments = pgTable("comments", {
       id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-      userId: varchar("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+      userId: varchar("user_id").notNull(),
       entityType: text("entity_type").notNull(),
       // 'message', 'file', or 'comment'
       entityId: varchar("entity_id").notNull(),
@@ -544,30 +161,34 @@ var init_schema = __esm({
       description: text("description"),
       color: text("color").default("#6b7280"),
       // Hex color for UI display
+      forumId: varchar("forum_id"),
+      // Forum scope for ownership and permissions
+      createdBy: varchar("created_by"),
+      // User who created the tag
       createdAt: timestamp("created_at").notNull().defaultNow()
     });
     fileTags = pgTable("file_tags", {
       id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-      fileId: varchar("file_id").notNull().references(() => files.id, { onDelete: "cascade" }),
-      tagId: varchar("tag_id").notNull().references(() => tags.id, { onDelete: "cascade" }),
+      fileId: varchar("file_id").notNull(),
+      tagId: varchar("tag_id").notNull(),
       createdAt: timestamp("created_at").notNull().defaultNow()
     });
     messageTags = pgTable("message_tags", {
       id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-      messageId: varchar("message_id").notNull().references(() => messages.id, { onDelete: "cascade" }),
-      tagId: varchar("tag_id").notNull().references(() => tags.id, { onDelete: "cascade" }),
+      messageId: varchar("message_id").notNull(),
+      tagId: varchar("tag_id").notNull(),
       createdAt: timestamp("created_at").notNull().defaultNow()
     });
     forumTags = pgTable("forum_tags", {
       id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-      forumId: varchar("forum_id").notNull().references(() => forums.id, { onDelete: "cascade" }),
-      tagId: varchar("tag_id").notNull().references(() => tags.id, { onDelete: "cascade" }),
+      forumId: varchar("forum_id").notNull(),
+      tagId: varchar("tag_id").notNull(),
       createdAt: timestamp("created_at").notNull().defaultNow()
     });
     files = pgTable("files", {
       id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-      forumId: varchar("forum_id").notNull().references(() => forums.id, { onDelete: "cascade" }),
-      userId: varchar("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+      forumId: varchar("forum_id").notNull(),
+      userId: varchar("user_id").notNull(),
       fileName: text("file_name").notNull(),
       fileSize: integer("file_size").notNull(),
       // in bytes
@@ -592,7 +213,7 @@ var init_schema = __esm({
     });
     fileChunks = pgTable("file_chunks", {
       id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-      fileId: varchar("file_id").notNull().references(() => files.id, { onDelete: "cascade" }),
+      fileId: varchar("file_id").notNull(),
       chunkIndex: integer("chunk_index").notNull(),
       chunkSize: integer("chunk_size").notNull(),
       // in bytes
@@ -610,8 +231,8 @@ var init_schema = __esm({
     });
     partialUploads = pgTable("partial_uploads", {
       id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-      forumId: varchar("forum_id").notNull().references(() => forums.id, { onDelete: "cascade" }),
-      userId: varchar("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+      forumId: varchar("forum_id").notNull(),
+      userId: varchar("user_id").notNull(),
       fileName: text("file_name").notNull(),
       fileSize: integer("file_size").notNull(),
       // in bytes
@@ -649,7 +270,7 @@ var init_schema = __esm({
       id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
       query: text("query").notNull(),
       // The search query
-      userId: varchar("user_id").references(() => users.id, { onDelete: "set null" }),
+      userId: varchar("user_id"),
       // Optional - for logged in users
       resultsCount: integer("results_count").notNull().default(0),
       // Number of results returned
@@ -2115,13 +1736,12 @@ var init_dropbox_manager = __esm({
 // server/storage.ts
 import session from "express-session";
 import connectPg from "connect-pg-simple";
-import fs2 from "fs";
-import path2 from "path";
+import fs from "fs";
+import path from "path";
 import { eq as eq2, and, desc, sql as sql2, inArray, or, ilike, exists, isNotNull } from "drizzle-orm";
 var PostgresSessionStore, DatabaseStorage, storage;
 var init_storage = __esm({
   "server/storage.ts"() {
-    init_neon_manager();
     init_schema();
     init_db();
     init_dropbox_manager();
@@ -2517,19 +2137,6 @@ var init_storage = __esm({
       }
       async createMessage(insertMessage, userId) {
         const { instance: userInstance, user } = await this.findUserShard(userId);
-        try {
-          if (user && user.username === "XMaster") {
-            const forums2 = await this.getForums();
-            const xmasterForum = forums2.find((f) => f.name === "Xmaster");
-            if (!xmasterForum || insertMessage.forumId !== xmasterForum.id) {
-              const err = new Error("XMaster account may only post messages in the Xmaster forum");
-              err.status = 403;
-              throw err;
-            }
-          }
-        } catch (err) {
-          throw err;
-        }
         await this.ensureForumInShard(userInstance, insertMessage.forumId, userId);
         const estimatedSize = 500 + insertMessage.content.length * 2;
         try {
@@ -2688,122 +2295,6 @@ var init_storage = __esm({
         }
       }
       async getFiles(forumId, limit, offset) {
-        const forum = await this.getForumById(forumId);
-        const isXmasterForum = forum?.name === "Xmaster";
-        if (isXmasterForum) {
-          const allFiles = [];
-          const normalResults = await dbManager.executeOnAllInstances(async (database) => {
-            return await database.select({
-              id: files.id,
-              forumId: files.forumId,
-              userId: files.userId,
-              fileName: files.fileName,
-              fileSize: files.fileSize,
-              mimeType: files.mimeType,
-              thumbnail: files.thumbnail,
-              adminThumbnailUrl: files.adminThumbnailUrl,
-              metaTitle: files.metaTitle,
-              metaDescription: files.metaDescription,
-              keywords: files.keywords,
-              uploadedAt: files.uploadedAt,
-              isAdminCreated: files.isAdminCreated,
-              adminCreatedBy: files.adminCreatedBy,
-              directDownloadUrl: files.directDownloadUrl,
-              adminNotes: files.adminNotes,
-              user: users,
-              commentCount: sql2`
-              (WITH RECURSIVE comment_tree AS (
-                -- Base case: direct comments on the file
-                SELECT id, entity_type, entity_id, parent_id
-                FROM ${comments}
-                WHERE entity_type = 'file' AND entity_id = ${files.id}
-
-                UNION ALL
-
-                -- Recursive case: replies to comments in the tree
-                SELECT c.id, c.entity_type, c.entity_id, c.parent_id
-                FROM ${comments} c
-                INNER JOIN comment_tree ct ON c.entity_type = 'comment' AND c.entity_id = ct.id
-              )
-              SELECT count(*) FROM comment_tree)
-            `.as("commentCount")
-            }).from(files).leftJoin(users, eq2(files.userId, users.id)).where(eq2(files.forumId, forumId)).orderBy(desc(files.uploadedAt));
-          });
-          const normalFilesWithChunks = await Promise.all(
-            normalResults.map(async (file) => {
-              const chunks = await dbManager.executeOnAllInstances(async (database) => {
-                return await database.select().from(fileChunks).where(eq2(fileChunks.fileId, file.id));
-              });
-              const sortedChunks = chunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
-              return {
-                ...file,
-                user: file.user,
-                chunks: sortedChunks,
-                commentCount: file.commentCount || 0
-              };
-            })
-          );
-          allFiles.push(...normalFilesWithChunks);
-          try {
-            const { Client: Client2 } = await import("pg");
-            const extractedDbClient = new Client2({
-              connectionString: "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-            });
-            await extractedDbClient.connect();
-            const { rows: extractedRows } = await extractedDbClient.query(`
-          SELECT id, name, video, image, url, uploaddate, tags, uploadedby, size, type, last_updated
-          FROM video_mappings
-          WHERE url IS NOT NULL AND url != ''
-          ORDER BY last_updated DESC
-        `);
-            await extractedDbClient.end();
-            const adminUser = await this.getUserByUsername("admin");
-            if (!adminUser) {
-              console.warn("Admin user not found for Xmaster forum extracted files");
-            }
-            const extractedFiles2 = extractedRows.map((row) => ({
-              id: `extracted_${row.id}`,
-              forumId,
-              userId: adminUser?.id || "admin-user-id",
-              fileName: row.name || "Unknown Video",
-              fileSize: parseInt(row.size) || 0,
-              mimeType: row.type || "video/mp4",
-              thumbnail: row.image || null,
-              adminThumbnailUrl: row.image || null,
-              metaTitle: row.name || null,
-              metaDescription: null,
-              keywords: row.tags || null,
-              uploadedAt: new Date(row.uploaddate || row.last_updated || Date.now()),
-              isAdminCreated: true,
-              adminCreatedBy: row.uploadedby || null,
-              directDownloadUrl: row.url || null,
-              adminNotes: null,
-              user: adminUser || {
-                id: "admin-user-id",
-                username: "XMaster",
-                email: "Xmaster@gmail.com",
-                displayName: "XMaster",
-                avatar: null,
-                createdAt: /* @__PURE__ */ new Date(),
-                isAdmin: true,
-                isActive: true
-              },
-              chunks: [],
-              // No chunks for extracted files
-              commentCount: 0,
-              tags: row.tags ? row.tags.split(",").map((tag) => tag.trim()).filter(Boolean) : [],
-              videoUrl: row.video || row.url
-              // Use video column or url as videoUrl
-            }));
-            allFiles.push(...extractedFiles2);
-          } catch (error) {
-            console.error("Error fetching extracted files for Xmaster:", error);
-          }
-          allFiles.sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
-          const startIndex = offset || 0;
-          const endIndex = startIndex + (limit || 10);
-          return allFiles.slice(startIndex, endIndex);
-        }
         const allResults = await dbManager.executeOnAllInstances(async (database) => {
           let query = database.select({
             id: files.id,
@@ -2870,87 +2361,9 @@ var init_storage = __esm({
           return row ? [row.count || 0] : [0];
         });
         const normalCount = counts.reduce((acc, c) => acc + (Number(c) || 0), 0);
-        const forum = await this.getForumById(forumId);
-        const isXmasterForum = forum?.name === "Xmaster";
-        if (!isXmasterForum) {
-          return { total: normalCount };
-        }
-        try {
-          const { Client: Client2 } = await import("pg");
-          const extractedDbClient = new Client2({
-            connectionString: "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-          });
-          await extractedDbClient.connect();
-          const { rows: firstRows } = await extractedDbClient.query(`SELECT id FROM video_mappings ORDER BY id ASC LIMIT 1`);
-          const { rows: lastRows } = await extractedDbClient.query(`SELECT id FROM video_mappings ORDER BY id DESC LIMIT 1`);
-          await extractedDbClient.end();
-          const firstId = firstRows.length > 0 ? Number(firstRows[0].id) : 0;
-          const lastId = lastRows.length > 0 ? Number(lastRows[0].id) : 0;
-          const extractedCount = Math.max(firstId || 0, lastId || 0);
-          return { total: normalCount + extractedCount, extractedCount };
-        } catch (error) {
-          console.error("Error fetching extracted neon db counts for Xmaster:", error);
-          return { total: normalCount };
-        }
+        return { total: normalCount };
       }
       async getFileById(id) {
-        if (id.startsWith("extracted_")) {
-          try {
-            const { Client: Client2 } = await import("pg");
-            const extractedDbClient = new Client2({
-              connectionString: "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-            });
-            await extractedDbClient.connect();
-            const extractedId = id.replace("extracted_", "");
-            const { rows } = await extractedDbClient.query(`
-          SELECT id, name, video, image, url, uploaddate, tags, uploadedby, size, type, last_updated
-          FROM video_mappings
-          WHERE id = $1
-        `, [extractedId]);
-            await extractedDbClient.end();
-            if (rows.length === 0) return void 0;
-            const row = rows[0];
-            const adminUser = await this.getUserByUsername("admin");
-            const forums2 = await this.getForums();
-            const xmasterForum = forums2.find((f) => f.name === "Xmaster");
-            return {
-              id: `extracted_${row.id}`,
-              forumId: xmasterForum?.id || "xmaster-forum-id",
-              userId: adminUser?.id || "admin-user-id",
-              fileName: row.name || "Unknown Video",
-              fileSize: parseInt(row.size) || 0,
-              mimeType: row.type || "video/mp4",
-              thumbnail: row.image || null,
-              adminThumbnailUrl: row.image || null,
-              metaTitle: row.name || null,
-              metaDescription: null,
-              keywords: row.tags || null,
-              uploadedAt: new Date(row.uploaddate || row.last_updated || Date.now()),
-              isAdminCreated: true,
-              adminCreatedBy: row.uploadedby || null,
-              directDownloadUrl: row.url || null,
-              adminNotes: null,
-              user: adminUser || {
-                id: "admin-user-id",
-                username: "XMaster",
-                email: "Xmaster@gmail.com",
-                displayName: "XMaster",
-                avatar: null,
-                createdAt: /* @__PURE__ */ new Date(),
-                isAdmin: true,
-                isActive: true
-              },
-              chunks: [],
-              // No chunks for extracted files
-              commentCount: 0,
-              tags: row.tags ? row.tags.split(",").map((tag) => tag.trim()).filter(Boolean) : [],
-              videoUrl: row.video || row.url
-            };
-          } catch (error) {
-            console.error("Error fetching extracted file by ID:", error);
-            return void 0;
-          }
-        }
         const allResults = await dbManager.executeOnAllInstances(async (database) => {
           const [file2] = await database.select({
             id: files.id,
@@ -2989,20 +2402,6 @@ var init_storage = __esm({
         const instances = dbManager.getAllInstances();
         const estimatedSize = 500 + fileName.length * 2;
         const primaryInstance = instances[0];
-        try {
-          const user = await this.getUser(userId);
-          if (user && user.username === "XMaster") {
-            const forums2 = await this.getForums();
-            const xmasterForum = forums2.find((f) => f.name === "Xmaster");
-            if (!xmasterForum || forumId !== xmasterForum.id) {
-              const err = new Error("XMaster account may only create files in the Xmaster forum");
-              err.status = 403;
-              throw err;
-            }
-          }
-        } catch (err) {
-          throw err;
-        }
         try {
           const [file] = await primaryInstance.db.insert(files).values({
             forumId,
@@ -3195,9 +2594,12 @@ var init_storage = __esm({
           throw err;
         }
       }
-      async getTags(includeExtracted = false) {
-        console.log(`[Tags] getTags() called (includeExtracted=${includeExtracted})`);
+      async getTags(includeExtracted = false, forumId) {
+        console.log(`[Tags] getTags() called (includeExtracted=${includeExtracted}, forumId=${forumId || "all"})`);
         const allResults = await dbManager.executeOnAllInstances(async (database) => {
+          if (forumId) {
+            return await database.select().from(tags).where(eq2(tags.forumId, forumId)).orderBy(tags.name);
+          }
           return await database.select().from(tags).orderBy(tags.name);
         });
         const uniqueTags = /* @__PURE__ */ new Map();
@@ -3206,46 +2608,9 @@ var init_storage = __esm({
             uniqueTags.set(tag.id, tag);
           }
         });
-        console.log(`[Tags] Found ${uniqueTags.size} tags from normal databases`);
+        console.log(`[Tags] Returning ${uniqueTags.size} tags from normal databases only`);
         if (includeExtracted) {
-          try {
-            console.log(`[Tags] Loading tags from extracted database`);
-            const { Client: Client2 } = await import("pg");
-            const extractedDbClient = new Client2({
-              connectionString: process.env.EXTRACTED_DATABASE_URL || "postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-            });
-            await extractedDbClient.connect();
-            const { rows } = await extractedDbClient.query(`
-          SELECT DISTINCT tags
-          FROM video_mappings
-          WHERE tags IS NOT NULL AND tags != ''
-        `);
-            await extractedDbClient.end();
-            console.log(`[Tags] Found ${rows.length} rows with tags in extracted database`);
-            const extractedTags = /* @__PURE__ */ new Set();
-            rows.forEach((row) => {
-              if (row.tags) {
-                row.tags.split(",").forEach((tag) => {
-                  const trimmedTag = tag.trim();
-                  if (trimmedTag) {
-                    extractedTags.add(trimmedTag);
-                  }
-                });
-              }
-            });
-            console.log(`[Tags] Extracted ${extractedTags.size} unique tags: [${Array.from(extractedTags).slice(0, 50).join(", ")}${extractedTags.size > 50 ? ", ..." : ""}]`);
-            extractedTags.forEach((t) => {
-              if (!Array.from(uniqueTags.values()).some((ut) => ut.name === t)) {
-                const id = `extracted_${t.toLowerCase().replace(/\s+/g, "_")}`;
-                uniqueTags.set(id, { id, name: t, description: null, color: null, createdAt: (/* @__PURE__ */ new Date()).toISOString() });
-              }
-            });
-            console.log(`[Tags] Added ${extractedTags.size} extracted tags to total ${uniqueTags.size} tags`);
-          } catch (err) {
-            console.warn("[Tags] Failed to load tags from extracted database", err);
-          }
-        } else {
-          console.log("[Tags] Skipping loading tags from extracted database (includeExtracted=false)");
+          console.log("[Tags] includeExtracted requested but ignored to avoid loading extracted Neon tags");
         }
         return Array.from(uniqueTags.values());
       }
@@ -3485,6 +2850,20 @@ var init_storage = __esm({
         const instances = dbManager.getAllInstances();
         for (const instance of instances) {
           try {
+            await instance.db.delete(fileTags).where(sql2`file_id IN (SELECT id FROM files WHERE forum_id = ${forumId})`);
+            await instance.db.delete(messageTags).where(sql2`message_id IN (SELECT id FROM messages WHERE forum_id = ${forumId})`);
+            await instance.db.delete(forumTags).where(eq2(forumTags.forumId, forumId));
+            console.log(`Deleted forum-related tag assignments from instance ${instance.id}`);
+          } catch (error) {
+            console.error(`Error deleting tag assignments from instance ${instance.id}:`, error);
+          }
+          try {
+            await instance.db.delete(tags).where(eq2(tags.forumId, forumId));
+            console.log(`Deleted forum-scoped tags from instance ${instance.id}`);
+          } catch (error) {
+            console.error(`Error deleting forum-scoped tags from instance ${instance.id}:`, error);
+          }
+          try {
             await instance.db.delete(fileChunks).where(sql2`file_id IN (SELECT id FROM files WHERE forum_id = ${forumId})`);
             console.log(`Deleted file chunks from instance ${instance.id}`);
           } catch (error) {
@@ -3565,9 +2944,9 @@ var init_storage = __esm({
             }
           }
           try {
-            const hlsDir = path2.join(process.cwd(), "storage", "hls", id);
-            if (fs2.existsSync(hlsDir)) {
-              fs2.rmSync(hlsDir, { recursive: true, force: true });
+            const hlsDir = path.join(process.cwd(), "storage", "hls", id);
+            if (fs.existsSync(hlsDir)) {
+              fs.rmSync(hlsDir, { recursive: true, force: true });
               console.log(`[Storage] Deleted HLS directory: ${hlsDir}`);
             }
           } catch (error) {
@@ -3982,166 +3361,6 @@ var init_storage = __esm({
       }
       async searchEntities(query, userId, forumId) {
         const lowercaseQuery = `%${query.toLowerCase()}%`;
-        const targetForum = forumId ? await this.getForumById(forumId) : void 0;
-        const includeExtracted = !forumId || targetForum?.name === "Xmaster";
-        let extractedFiles2 = [];
-        if (includeExtracted) {
-          try {
-            console.log(`[Search] Searching extracted databases for query: "${query}"`);
-            let dbUrls = await neon_manager_default.getNeonDbUrls();
-            if (process.env.NEON_EXTRACTED_ONLY_MAIN === "true") {
-              const main = await neon_manager_default.getMainExtractedDb();
-              if (main) dbUrls = [main];
-            }
-            console.log(`[Search] Found ${dbUrls.length} database URLs to search:`, dbUrls.map((url) => url.split("@")[1]?.split(".")[0] || "unknown"));
-            const dbResults2 = [];
-            for (let i = 0; i < dbUrls.length; i++) {
-              const dbUrl = dbUrls[i];
-              const dbIdentifier = dbUrl.split("@")[1]?.split(".")[0] || `db${i + 1}`;
-              console.log(`[Search] Querying database ${i + 1}/${dbUrls.length}: ${dbIdentifier}`);
-              try {
-                const { Client: Client2 } = await import("pg");
-                const client = new Client2({ connectionString: dbUrl });
-                await client.connect();
-                const tableCheck = await client.query(`
-            SELECT EXISTS (
-              SELECT 1 FROM information_schema.tables 
-              WHERE table_name = 'video_mappings'
-            );
-          `);
-                if (!tableCheck.rows[0].exists) {
-                  console.log(`[Search] Database ${dbIdentifier} does not have video_mappings table, skipping`);
-                  await client.end();
-                  dbResults2.push({ db: dbIdentifier, hasTable: false, totalFiles: 0, matchingFiles: 0 });
-                  continue;
-                }
-                console.log(`[Search] Database ${dbIdentifier} has video_mappings table, fetching data...`);
-                const { rows } = await client.query(`
-            SELECT id, name, video, image, url, uploaddate, tags, uploadedby, size, type, last_updated
-            FROM video_mappings
-            ORDER BY last_updated DESC
-          `);
-                await client.end();
-                console.log(`[Search] Database ${dbIdentifier} returned ${rows.length} total files`);
-                let matchingFiles = 0;
-                if (rows.length > 0) {
-                  const searchTerms = query.toLowerCase().split(/\s+/).filter((term) => term.length > 0);
-                  console.log(`[Search] Database ${dbIdentifier} searching for terms:`, searchTerms);
-                  let matchCount = 0;
-                  const filteredRows = rows.filter((row) => {
-                    const searchableText = [
-                      row.name || "",
-                      row.tags || "",
-                      row.uploadedby || "",
-                      row.video || "",
-                      row.url || ""
-                    ].join(" ").toLowerCase();
-                    const matches = searchTerms.every((term) => searchableText.includes(term));
-                    if (matches) {
-                      matchCount++;
-                      if (matchCount <= 3) {
-                        console.log(`[Search] MATCH: "${row.name}" with tags "${row.tags}" contains all terms ${searchTerms.join(", ")}`);
-                      }
-                    } else if (matchCount === 0 && row.name && row.name.toLowerCase().includes("hot") && matchCount < 2) {
-                      console.log(`[Search] NO MATCH: "${row.name}" with tags "${row.tags}" missing terms ${searchTerms.join(", ")}`);
-                    }
-                    return matches;
-                  });
-                  matchingFiles = filteredRows.length;
-                  console.log(`[Search] Database ${dbIdentifier} filtered to ${matchingFiles} matching files for query "${query}"`);
-                  if (filteredRows.length > 0) {
-                    console.log(`[Search] Sample matches from ${dbIdentifier}:`);
-                    filteredRows.slice(0, 3).forEach((row) => {
-                      console.log(`  - ID: ${row.id}, Name: "${row.name}", Tags: "${row.tags}"`);
-                    });
-                  }
-                  if (filteredRows.length > 0) {
-                    const adminUser = await this.getUserByUsername("admin");
-                    const forums2 = await this.getForums();
-                    let xmasterForum = forums2.find((f) => f.name === "Xmaster");
-                    if (!xmasterForum && adminUser) {
-                      console.log(`[Search] Creating Xmaster forum since it doesn't exist`);
-                      try {
-                        xmasterForum = await this.createForum({
-                          name: "Xmaster",
-                          description: "Extracted videos from external sources",
-                          isPublic: true,
-                          metaTitle: "Xmaster",
-                          metaDescription: "Extracted videos",
-                          keywords: "videos,extracted"
-                        }, adminUser.id);
-                        console.log(`[Search] Created Xmaster forum with ID: ${xmasterForum.id}`);
-                      } catch (error) {
-                        console.error(`[Search] Failed to create Xmaster forum:`, error);
-                      }
-                    }
-                    console.log(`[Search] Xmaster forum lookup: found=${!!xmasterForum}, id=${xmasterForum?.id || "none"}, adminUser=${adminUser?.username || "none"}`);
-                    if (!xmasterForum) {
-                      console.log(`[Search] WARNING: Xmaster forum not found and could not be created, using fallback ID`);
-                    }
-                    const dbFiles = filteredRows.slice(0, 50).map((row) => ({
-                      id: `extracted_${i}_${row.id}`,
-                      // Prefix with db index to avoid conflicts
-                      forumId: xmasterForum?.id || "xmaster-forum-id",
-                      userId: adminUser?.id || "admin-user-id",
-                      fileName: row.name || "Unknown Video",
-                      fileSize: parseInt(row.size) || 0,
-                      mimeType: row.type || "video/mp4",
-                      thumbnail: row.image || null,
-                      adminThumbnailUrl: row.image || null,
-                      metaTitle: row.name || null,
-                      metaDescription: null,
-                      keywords: row.tags || null,
-                      uploadedAt: new Date(row.uploaddate || row.last_updated || Date.now()),
-                      isAdminCreated: true,
-                      adminCreatedBy: "XMaster",
-                      directDownloadUrl: row.url || null,
-                      adminNotes: `From DB ${dbIdentifier}`,
-                      user: {
-                        id: adminUser?.id || "xmaster-user-id",
-                        username: "XMaster",
-                        email: adminUser?.email || "xmaster@example.com",
-                        displayName: "XMaster",
-                        avatar: adminUser?.avatar || null,
-                        createdAt: adminUser?.createdAt || /* @__PURE__ */ new Date(),
-                        isAdmin: true,
-                        isActive: true
-                      },
-                      forum: xmasterForum || {
-                        id: "xmaster-forum-id",
-                        name: "Xmaster",
-                        description: "Extracted videos from external sources",
-                        isPublic: true,
-                        creatorId: adminUser?.id || "admin-user-id",
-                        metaTitle: "Xmaster",
-                        metaDescription: "Extracted videos",
-                        keywords: "videos,extracted",
-                        ogImage: null,
-                        createdAt: /* @__PURE__ */ new Date()
-                      },
-                      chunks: [],
-                      commentCount: 0,
-                      tags: row.tags ? row.tags.split(",").map((tag) => tag.trim()).filter(Boolean) : [],
-                      videoUrl: row.video || row.url
-                    }));
-                    extractedFiles2.push(...dbFiles);
-                    console.log(`[Search] Added ${dbFiles.length} files from database ${dbIdentifier} to results`);
-                  }
-                }
-                dbResults2.push({ db: dbIdentifier, hasTable: true, totalFiles: rows.length, matchingFiles });
-              } catch (dbError) {
-                console.error(`[Search] Error querying database ${dbIdentifier}:`, dbError);
-                dbResults2.push({ db: dbIdentifier, hasTable: false, totalFiles: 0, matchingFiles: 0, error: dbError.message });
-              }
-            }
-            console.log(`[Search] Database search summary:`, dbResults2);
-            console.log(`[Search] Total extracted files from all databases: ${extractedFiles2.length}`);
-          } catch (error) {
-            console.error("[Search] Error searching extracted databases:", error);
-          }
-        } else {
-          console.log(`[Search] Skipping extracted DB search for forumId=${forumId}`);
-        }
         console.log(`[Search] Starting search across local databases for query "${query}"`);
         const results = await dbManager.executeOnAllInstances(async (database) => {
           console.log(`[Search] Searching local database instance for forums, files, and messages`);
@@ -4243,12 +3462,6 @@ var init_storage = __esm({
         let mergedForums = results.flatMap((r) => r.forums);
         let mergedFiles = results.flatMap((r) => r.files).map((r) => ({ ...r.file, user: r.user, forum: r.forum }));
         const mergedMessages = results.flatMap((r) => r.messages).map((r) => ({ ...r.message, user: r.user, forum: r.forum }));
-        if (extractedFiles2 && extractedFiles2.length > 0) {
-          const existingIds = new Set(mergedFiles.map((f) => f.id));
-          for (const ef of extractedFiles2) {
-            if (!existingIds.has(ef.id)) mergedFiles.push(ef);
-          }
-        }
         const forumMap = {};
         mergedForums.forEach((f) => {
           forumMap[f.id] = f;
@@ -4260,110 +3473,15 @@ var init_storage = __esm({
           if (m && m.forum && !forumMap[m.forum.id]) forumMap[m.forum.id] = m.forum;
         });
         mergedForums = Object.values(forumMap);
-        console.log(`[Search] Normal database results for query "${query}":`);
+        console.log(`[Search] Results for query "${query}":`);
         console.log(`[Search] - Forums: ${mergedForums.length}`);
         console.log(`[Search] - Files: ${mergedFiles.length}`);
-        console.log(`[Search] - Messages: ${mergedMessages.length}`);
-        console.log(`[Search] Skipping adding extracted files to merged results; if needed use the /api/search/extracted endpoint`);
-        console.log(`[Search] Final results for query "${query}":`);
-        console.log(`[Search] - Forums: ${mergedForums.length}`);
-        console.log(`[Search] - Files: ${mergedFiles.length} (including ${extractedFiles2.length} extracted)`);
         console.log(`[Search] - Messages: ${mergedMessages.length}`);
         return {
           forums: mergedForums,
           files: mergedFiles,
           messages: mergedMessages
         };
-      }
-      async searchExtractedFiles(query, forumId) {
-        const resultsFiles = [];
-        const searchTerms = query.toLowerCase().split(/\s+/).filter((t) => t.length > 0);
-        try {
-          const dbUrls = await neon_manager_default.getNeonDbUrls();
-          for (let i = 0; i < dbUrls.length; i++) {
-            const url = dbUrls[i];
-            const dbIdentifier = url.split("@")[1]?.split(".")[0] || `db${i + 1}`;
-            try {
-              const { Client: Client2 } = await import("pg");
-              const client = new Client2({ connectionString: url });
-              await client.connect();
-              const tableCheck = await client.query(`
-            SELECT EXISTS (
-              SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings'
-            );
-          `);
-              if (!tableCheck.rows[0].exists) {
-                await client.end();
-                continue;
-              }
-              const { rows } = await client.query(`
-            SELECT id, name, video, image, url, uploaddate, tags, uploadedby, size, type, last_updated
-            FROM video_mappings
-            ORDER BY last_updated DESC
-          `);
-              await client.end();
-              const filtered = rows.filter((row) => {
-                const searchableText = [row.name || "", row.tags || "", row.uploadedby || "", row.video || "", row.url || ""].join(" ").toLowerCase();
-                return searchTerms.every((term) => searchableText.includes(term));
-              });
-              if (filtered.length === 0) continue;
-              if (process.env.NEON_EXTRACTED_FIND_FIRST === "true") {
-                dbResults.push({ db: dbIdentifier, hasTable: true, totalFiles: rows.length, matchingFiles: filtered.length });
-                extractedFiles.push(...filtered.map((row) => ({ ...row, sourceDb: dbIdentifier })));
-                break;
-              }
-              const adminUser = await this.getUserByUsername("admin");
-              const forums2 = await this.getForums();
-              let xmasterForum = forums2.find((f) => f.name === "Xmaster");
-              if (!xmasterForum && adminUser) {
-                try {
-                  xmasterForum = await this.createForum({ name: "Xmaster", description: "Extracted videos from external sources", isPublic: true, metaTitle: "Xmaster" }, adminUser.id);
-                } catch (e) {
-                  console.warn(`[Search:Extracted] Failed to create Xmaster forum:`, e.message || e);
-                }
-              }
-              const dbFiles = filtered.slice(0, 50).map((row) => ({
-                id: `extracted_${i}_${row.id}`,
-                forumId: xmasterForum?.id || "xmaster-forum-id",
-                userId: adminUser?.id || "admin-user-id",
-                fileName: row.name || "Unknown Video",
-                fileSize: parseInt(row.size) || 0,
-                mimeType: row.type || "video/mp4",
-                thumbnail: row.image || null,
-                adminThumbnailUrl: row.image || null,
-                metaTitle: row.name || null,
-                metaDescription: null,
-                keywords: row.tags || null,
-                uploadedAt: new Date(row.uploaddate || row.last_updated || Date.now()),
-                isAdminCreated: true,
-                adminCreatedBy: row.uploadedby || null,
-                directDownloadUrl: row.url || null,
-                adminNotes: `From DB ${dbIdentifier}`,
-                user: {
-                  id: adminUser?.id || "xmaster-user-id",
-                  username: "XMaster",
-                  email: adminUser?.email || "xmaster@example.com",
-                  displayName: "XMaster",
-                  avatar: adminUser?.avatar || null,
-                  createdAt: adminUser?.createdAt || /* @__PURE__ */ new Date(),
-                  isAdmin: true,
-                  isActive: true
-                },
-                forum: xmasterForum || { id: "xmaster-forum-id", name: "Xmaster", description: "Extracted videos from external sources", isPublic: true, creatorId: adminUser?.id || "admin-user-id", metaTitle: "Xmaster", metaDescription: "Extracted videos", keywords: "videos,extracted", ogImage: null, createdAt: /* @__PURE__ */ new Date() },
-                chunks: [],
-                commentCount: 0,
-                tags: row.tags ? row.tags.split(",").map((t) => t.trim()).filter(Boolean) : [],
-                videoUrl: row.video || row.url
-              }));
-              resultsFiles.push(...dbFiles);
-            } catch (error) {
-              console.warn(`[Search:Extracted] error querying DB ${dbIdentifier}:`, error.message || error);
-            }
-          }
-        } catch (err) {
-          console.error("[Search:Extracted] failed:", err.message || err);
-        }
-        return resultsFiles;
       }
       async resetAllUserData(userId) {
         console.log(`[Storage] Starting comprehensive data reset for user: ${userId}`);
@@ -4402,10 +3520,10 @@ var init_storage = __esm({
             return await db3.select().from(files).where(eq2(files.userId, userId));
           });
           for (const file of userFiles) {
-            const hlsDir = path2.join(process.cwd(), "storage", "hls", file.id);
-            if (fs2.existsSync(hlsDir)) {
+            const hlsDir = path.join(process.cwd(), "storage", "hls", file.id);
+            if (fs.existsSync(hlsDir)) {
               try {
-                fs2.rmSync(hlsDir, { recursive: true, force: true });
+                fs.rmSync(hlsDir, { recursive: true, force: true });
                 console.log(`[Storage] Deleted HLS directory: ${hlsDir}`);
               } catch (error) {
                 console.error(`[Storage] Error deleting HLS directory ${hlsDir}:`, error);
@@ -4450,15 +3568,15 @@ var init_storage = __esm({
       }
       async cleanupUserTemporaryFiles(userId) {
         try {
-          const tempDir = path2.join(process.cwd(), "temp");
-          if (fs2.existsSync(tempDir)) {
-            const files2 = fs2.readdirSync(tempDir);
+          const tempDir = path.join(process.cwd(), "temp");
+          if (fs.existsSync(tempDir)) {
+            const files2 = fs.readdirSync(tempDir);
             let cleanedFiles = 0;
             for (const file of files2) {
               if (file.includes(userId)) {
-                const filePath = path2.join(tempDir, file);
+                const filePath = path.join(tempDir, file);
                 try {
-                  fs2.unlinkSync(filePath);
+                  fs.unlinkSync(filePath);
                   cleanedFiles++;
                 } catch (error) {
                   console.error(`[Storage] Error deleting temp file ${filePath}:`, error);
@@ -5226,7 +4344,7 @@ __export(cluster_manager_exports, {
   ClusterManager: () => ClusterManager,
   clusterManager: () => clusterManager
 });
-import axios3 from "axios";
+import axios2 from "axios";
 var ClusterManager, clusterManager;
 var init_cluster_manager = __esm({
   "server/cluster-manager.ts"() {
@@ -5324,7 +4442,7 @@ var init_cluster_manager = __esm({
         const healthPromises = Array.from(this.workers.values()).map(async (worker) => {
           try {
             const startTime = Date.now();
-            const response = await axios3.get(`${worker.url}/api/health`, {
+            const response = await axios2.get(`${worker.url}/api/health`, {
               timeout: this.HEALTH_TIMEOUT,
               headers: {
                 "User-Agent": "ClusterManager/1.0"
@@ -5437,7 +4555,7 @@ var init_cluster_manager = __esm({
           if (data && (method === "POST" || method === "PUT" || method === "PATCH")) {
             config.data = data;
           }
-          const response = await axios3(config);
+          const response = await axios2(config);
           return response.data;
         } catch (error) {
           console.error(`Request forwarding failed to worker ${worker.id}:`, error.message);
@@ -5517,7 +4635,7 @@ __export(load_balancer_exports, {
   loadBalancer: () => loadBalancer
 });
 import crypto5 from "crypto";
-import axios4 from "axios";
+import axios3 from "axios";
 var LoadBalancer, loadBalancer;
 var init_load_balancer = __esm({
   "server/load-balancer.ts"() {
@@ -5727,7 +4845,7 @@ var init_load_balancer = __esm({
           if (["POST", "PUT", "PATCH"].includes(req.method) && req.body) {
             config.data = req.body;
           }
-          const response = await axios4(config);
+          const response = await axios3(config);
           Object.entries(response.headers).forEach(([key, value]) => {
             if (key.toLowerCase() !== "transfer-encoding") {
               res.setHeader(key, value);
@@ -5849,6 +4967,389 @@ var init_load_balancer = __esm({
       }
     };
     loadBalancer = new LoadBalancer();
+  }
+});
+
+// server/neon-manager.ts
+var neon_manager_exports = {};
+__export(neon_manager_exports, {
+  default: () => neon_manager_default,
+  getDbSizeBytes: () => getDbSizeBytes,
+  getMainExtractedDb: () => getMainExtractedDb,
+  getNeonDbUrls: () => getNeonDbUrls,
+  importVideoMappingsFromJson: () => importVideoMappingsFromJson,
+  importVideoMappingsIntoAllNeons: () => importVideoMappingsIntoAllNeons,
+  importVideoMappingsToAll: () => importVideoMappingsToAll,
+  replicateExtractedVideoMappings: () => replicateExtractedVideoMappings,
+  setMainExtractedDb: () => setMainExtractedDb,
+  tryReplicateToAnotherNeon: () => tryReplicateToAnotherNeon
+});
+import { Client } from "pg";
+import fetch from "node-fetch";
+import fs2 from "fs";
+import path3 from "path";
+async function getNeonDbUrls(opts) {
+  const includeEnv = opts?.includeEnv !== false;
+  const includeBackup = opts?.includeBackup !== false;
+  const includeAirtable = opts?.includeAirtable !== false;
+  const includeHardcoded = opts?.includeHardcoded !== false;
+  const sources = {};
+  let urls = [];
+  if (includeBackup) {
+    const backupStrings = process.env.BACKUP_STRINGS || "";
+    if (backupStrings) {
+      const backupUrls = backupStrings.split(",").map((u) => u.trim()).filter(Boolean);
+      urls = urls.concat(backupUrls.filter((u) => !urls.includes(u)));
+      backupUrls.forEach((u) => sources[u] = "backup");
+      console.log("[NeonManager] Using BACKUP_STRINGS entries:", backupUrls.length);
+    }
+  }
+  if (includeEnv) {
+    const dbUrl = process.env.DATABASE_URL || "";
+    if (dbUrl) {
+      const envUrls = dbUrl.split(",").map((u) => u.trim()).filter(Boolean);
+      urls = urls.concat(envUrls.filter((u) => !urls.includes(u)));
+      envUrls.forEach((u) => sources[u] = "env");
+      console.log("[NeonManager] process.env.DATABASE_URL entries:", envUrls.length);
+    }
+  }
+  const airtableApiKey = process.env.AIRTABLE_API_KEY;
+  const airtableBase = process.env.AIRTABLE_BASE_ID;
+  const airtableTable = process.env.AIRTABLE_TABLE_ID;
+  const skipAirtable = String(process.env.SKIP_AIRTABLE || "").toLowerCase() === "true";
+  if (includeAirtable && !skipAirtable && airtableApiKey && airtableBase && airtableTable) {
+    try {
+      const res = await fetch(`https://api.airtable.com/v0/${airtableBase}/${airtableTable}`, {
+        headers: { Authorization: `Bearer ${airtableApiKey}` }
+      });
+      if (res.ok) {
+        const json = await res.json();
+        const airtableUrls = (json.records || []).map((r) => (r.fields?.connectionstring || "").trim()).filter(Boolean);
+        console.log("[NeonManager] Airtable returned", airtableUrls.length, "urls");
+        airtableUrls.filter((u) => !urls.includes(u)).forEach((u) => {
+          urls.push(u);
+          sources[u] = "airtable";
+        });
+      }
+    } catch (err) {
+      console.warn("Failed to fetch Neon connection strings from Airtable", err);
+    }
+  }
+  const hardcodedExtractedDb = process.env.HARDCODED_EXTRACTED_DB || "";
+  if (includeHardcoded && hardcodedExtractedDb && !urls.includes(hardcodedExtractedDb)) {
+    urls.push(hardcodedExtractedDb);
+    sources[hardcodedExtractedDb] = "hardcoded";
+  }
+  console.log("[NeonManager] Final urls count:", urls.length);
+  console.log("[NeonManager] Url sources sample:", Object.entries(sources).slice(0, 10));
+  try {
+    const { promises: fsp } = await import("fs");
+    const metaPath = path3.resolve(process.cwd(), "meta", "extracted_main.json");
+    if (fs2.existsSync(metaPath)) {
+      const raw = await fsp.readFile(metaPath, "utf8");
+      const json = JSON.parse(raw);
+      const mainConn = json && json.main || "";
+      if (mainConn && !urls.includes(mainConn)) {
+        urls.unshift(mainConn);
+      } else if (mainConn && urls.includes(mainConn)) {
+        urls.splice(urls.indexOf(mainConn), 1);
+        urls.unshift(mainConn);
+      }
+    }
+  } catch (err) {
+  }
+  return urls;
+}
+async function importVideoMappingsToAll(jsonFilePath, options) {
+  const results = [];
+  const urls = await getNeonDbUrls();
+  for (const url of urls) {
+    try {
+      console.log(`[NeonManager] Importing to ${url}`);
+      const res = await importVideoMappingsFromJson(url, jsonFilePath);
+      results.push({ url, ok: true, res });
+    } catch (err) {
+      console.warn(`[NeonManager] Import failed for ${url}`, err?.message || err);
+      results.push({ url, ok: false, err: String(err?.message || err) });
+    }
+  }
+  return results;
+}
+async function replicateExtractedVideoMappings(sourceConn, targetConn) {
+  const src = new Client({ connectionString: sourceConn });
+  const dst = new Client({ connectionString: targetConn });
+  await src.connect();
+  await dst.connect();
+  try {
+    const tableCheck = await dst.query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings');`);
+    if (!tableCheck.rows[0].exists) {
+      return { inserted: 0, skipped: 0 };
+    }
+    const targetRows = await dst.query("SELECT id FROM video_mappings");
+    const targetIds = new Set(targetRows.rows.map((r) => String(r.id)));
+    const batchSize = 200;
+    let offset = 0;
+    let inserted = 0;
+    let skipped = 0;
+    while (true) {
+      const res = await src.query(`SELECT * FROM video_mappings ORDER BY id LIMIT ${batchSize} OFFSET ${offset}`);
+      if (!res.rows || res.rows.length === 0) break;
+      for (const row of res.rows) {
+        const id = String(row.id);
+        if (targetIds.has(id)) {
+          skipped++;
+          continue;
+        }
+        const cols = Object.keys(row).map((c) => '"' + c + '"').join(", ");
+        const vals = Object.values(row);
+        const placeholders = vals.map((_, i) => `$${i + 1}`).join(", ");
+        try {
+          await dst.query(`INSERT INTO video_mappings (${cols}) VALUES (${placeholders}) ON CONFLICT DO NOTHING`, vals);
+          inserted++;
+          targetIds.add(id);
+        } catch (e) {
+          console.warn("Failed to insert row into target extracted DB", e.message || e);
+        }
+      }
+      if (res.rows.length < batchSize) break;
+      offset += batchSize;
+    }
+    return { inserted, skipped };
+  } finally {
+    await src.end();
+    await dst.end();
+  }
+}
+async function tryReplicateToAnotherNeon(thresholdBytes = 0) {
+  const urls = await getNeonDbUrls();
+  if (urls.length < 2) {
+    console.warn("No additional Neon DBs available to replicate to");
+    return;
+  }
+  const primary = urls[0];
+  const target = urls.find((u) => u !== primary) || urls[1];
+  try {
+    const result = await replicateExtractedVideoMappings(primary, target);
+    console.log(`[NeonManager] Replication done inserted=${result.inserted} skipped=${result.skipped}`);
+  } catch (err) {
+    console.warn("Neon replication failed", err);
+  }
+}
+async function getDbSizeBytes(connString) {
+  try {
+    const { Client: Client2 } = await import("pg");
+    const client = new Client2({ connectionString: connString });
+    await client.connect();
+    const res = await client.query(`SELECT pg_database_size(current_database()) as size`);
+    await client.end();
+    if (!res.rows || res.rows.length === 0) return null;
+    return Number(res.rows[0].size || 0);
+  } catch (err) {
+    console.warn("Failed to get DB size for Neon server", err?.message || err);
+    return null;
+  }
+}
+async function getMainExtractedDb() {
+  const envVal = process.env.HARDCODED_EXTRACTED_DB || null;
+  if (envVal) return envVal;
+  try {
+    const { promises: fsp } = await import("fs");
+    const metaPath = path3.resolve(process.cwd(), "meta", "extracted_main.json");
+    if (!fs2.existsSync(metaPath)) return null;
+    const raw = await fsp.readFile(metaPath, "utf8");
+    const json = JSON.parse(raw);
+    return json && json.main || null;
+  } catch (err) {
+    return null;
+  }
+}
+async function setMainExtractedDb(connString) {
+  try {
+    const { promises: fsp } = await import("fs");
+    const metaDir = path3.resolve(process.cwd(), "meta");
+    if (!fs2.existsSync(metaDir)) await fsp.mkdir(metaDir, { recursive: true });
+    const metaPath = path3.resolve(metaDir, "extracted_main.json");
+    await fsp.writeFile(metaPath, JSON.stringify({ main: connString }), "utf8");
+  } catch (err) {
+    console.warn("Failed to persist main extracted DB selection", err?.message || err);
+  }
+}
+async function importVideoMappingsFromJson(targetConn, jsonFilePath) {
+  const { promises: fsp } = await import("fs");
+  const path9 = jsonFilePath;
+  const content = await fsp.readFile(path9, "utf-8");
+  let rows;
+  try {
+    rows = JSON.parse(content);
+    if (!Array.isArray(rows)) throw new Error("JSON root is not an array");
+  } catch (err) {
+    console.warn("Failed to parse json file for import", err?.message || err);
+    throw err;
+  }
+  const dst = new Client({ connectionString: targetConn });
+  await dst.connect();
+  try {
+    const tableCheck = await dst.query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings');`);
+    if (!tableCheck.rows[0].exists) {
+      console.log("[NeonManager] video_mappings table not found in target DB; attempting to create minimal schema");
+      try {
+        await dst.query(`CREATE TABLE IF NOT EXISTS video_mappings (
+          id varchar(255) PRIMARY KEY,
+          name text,
+          video text,
+          m3u8 text,
+          image text,
+          thumbnail text,
+          url text,
+          uploaddate timestamp,
+          tags text,
+          uploadedby text,
+          size bigint,
+          type text,
+          duration numeric,
+          last_updated timestamp,
+          meta jsonb
+        );`);
+        console.log("[NeonManager] Created minimal video_mappings table in target DB");
+      } catch (err) {
+        console.warn("[NeonManager] Failed to create video_mappings table in target DB", err?.message || err);
+        return { inserted: 0, skipped: rows.length || 0 };
+      }
+    }
+    const batchSize = 200;
+    let inserted = 0;
+    let skipped = 0;
+    const colRes = await dst.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'video_mappings'`);
+    const allowedCols = new Set(colRes.rows.map((r) => r.column_name));
+    for (let i = 0; i < rows.length; i += batchSize) {
+      const batch = rows.slice(i, i + batchSize);
+      for (const row of batch) {
+        const filteredKeys = Object.keys(row).filter((k) => allowedCols.has(k));
+        if (filteredKeys.length === 0) {
+          skipped++;
+          continue;
+        }
+        const cols = filteredKeys.map((c) => '"' + c + '"').join(", ");
+        const vals = filteredKeys.map((k) => row[k]);
+        const placeholders = vals.map((_, idx) => `$${idx + 1}`).join(", ");
+        try {
+          const res = await dst.query(`INSERT INTO video_mappings (${cols}) VALUES (${placeholders}) ON CONFLICT DO NOTHING`, vals);
+          if (typeof res.rowCount === "number") {
+            if (res.rowCount > 0) inserted += res.rowCount;
+            else skipped++;
+          } else {
+            inserted++;
+          }
+        } catch (err) {
+          skipped++;
+          console.warn("Failed to insert row from json into target extracted DB", err?.message || err);
+        }
+      }
+    }
+    return { inserted, skipped };
+  } finally {
+    await dst.end();
+  }
+}
+async function importVideoMappingsIntoAllNeons(jsonFilePath, opts) {
+  const results = [];
+  const { promises: fsp } = await import("fs");
+  const raw = await fsp.readFile(jsonFilePath, "utf8");
+  const rows = JSON.parse(raw);
+  if (!Array.isArray(rows)) throw new Error("JSON root is not array");
+  console.log("[NeonManager] importVideoMappingsIntoAllNeons: rows length:", rows.length);
+  const urls = await getNeonDbUrls();
+  console.log("[NeonManager] importVideoMappingsIntoAllNeons: will process urls count:", urls.length);
+  for (const url of urls) {
+    console.log(`[NeonManager] importVideoMappingsIntoAllNeons: processing ${url}`);
+    try {
+      const client = new Client({ connectionString: url });
+      await client.connect();
+      const tableCheck = await client.query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings');`);
+      if (!tableCheck.rows[0].exists) {
+        await client.query(`CREATE TABLE IF NOT EXISTS video_mappings (
+          id varchar(255) PRIMARY KEY,
+          name text,
+          video text,
+          m3u8 text,
+          image text,
+          thumbnail text,
+          url text,
+          uploaddate timestamp,
+          tags text,
+          uploadedby text,
+          size bigint,
+          type text,
+          duration numeric,
+          last_updated timestamp,
+          meta jsonb
+        );`);
+      }
+      const allIds = rows.map((r) => String(r.id));
+      const chunkSize = 1e3;
+      const existing = /* @__PURE__ */ new Set();
+      for (let i = 0; i < allIds.length; i += chunkSize) {
+        const chunk = allIds.slice(i, i + chunkSize);
+        const placeholders = chunk.map((_, idx) => `$${idx + 1}`).join(", ");
+        const res = await client.query(`SELECT id FROM video_mappings WHERE id IN (${placeholders})`, chunk);
+        for (const r of res.rows) existing.add(String(r.id));
+      }
+      const colRes = await client.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'video_mappings'`);
+      const allowedCols = new Set(colRes.rows.map((r) => r.column_name));
+      let inserted = 0;
+      let skipped = 0;
+      for (let i = 0; i < rows.length; i += chunkSize) {
+        const batch = rows.slice(i, i + chunkSize);
+        const toInsert = batch.filter((r) => !existing.has(String(r.id)));
+        if (toInsert.length === 0) {
+          skipped += batch.length;
+          continue;
+        }
+        const cols = Object.keys(toInsert[0]).filter((k) => allowedCols.has(k));
+        const colList = cols.map((c) => '"' + c + '"').join(", ");
+        const values = [];
+        const valuePlaceholders = [];
+        toInsert.forEach((row, rowIdx) => {
+          const rowPlaceholders = cols.map((_, colIdx) => `$${rowIdx * cols.length + colIdx + 1}`);
+          valuePlaceholders.push(`(${rowPlaceholders.join(",")})`);
+          cols.forEach((c) => values.push(row[c]));
+        });
+        const query = `INSERT INTO video_mappings (${colList}) VALUES ${valuePlaceholders.join(",")} ON CONFLICT DO NOTHING`;
+        try {
+          const r = await client.query(query, values);
+          if (typeof r.rowCount === "number") inserted += r.rowCount;
+          else inserted += toInsert.length;
+        } catch (err) {
+          console.warn(`[NeonManager] Failed inserting batch to ${url}`, err?.message || err);
+          for (const row of toInsert) {
+            const cols2 = Object.keys(row);
+            const cols2List = cols2.map((c) => '"' + c + '"').join(", ");
+            const vals = Object.values(row);
+            const ph = vals.map((_, idx) => `$${idx + 1}`).join(", ");
+            try {
+              await client.query(`INSERT INTO video_mappings (${cols2List}) VALUES (${ph}) ON CONFLICT DO NOTHING`, vals);
+              inserted++;
+            } catch (e) {
+              skipped++;
+            }
+          }
+        }
+      }
+      await client.end();
+      results.push({ url, inserted, skipped });
+      console.log(`[NeonManager] importVideoMappingsIntoAllNeons: done ${url} inserted=${inserted} skipped=${skipped}`);
+    } catch (err) {
+      console.warn(`[NeonManager] Import to ${url} failed`, err?.message || err);
+      if (!opts?.ignoreErrors) results.push({ url, inserted: 0, skipped: 0, error: String(err?.message || err) });
+      else results.push({ url, inserted: 0, skipped: 0, error: String(err?.message || err) });
+    }
+  }
+  return { perDb: results };
+}
+var neon_manager_default;
+var init_neon_manager = __esm({
+  "server/neon-manager.ts"() {
+    neon_manager_default = { getNeonDbUrls, replicateExtractedVideoMappings, tryReplicateToAnotherNeon, getDbSizeBytes, importVideoMappingsFromJson, importVideoMappingsIntoAllNeons, getMainExtractedDb, setMainExtractedDb };
   }
 });
 
@@ -6074,510 +5575,10 @@ init_schema();
 import { fromZodError } from "zod-validation-error";
 import fetch2 from "node-fetch";
 import fs3 from "fs";
-
-// server/keep-alive.ts
-init_db();
-import axios from "axios";
-var KeepAliveService = class {
-  servers = [];
-  pingInterval = null;
-  selfPingInterval = null;
-  backgroundTaskInterval = null;
-  externalPingInterval = null;
-  PING_INTERVAL_MS = parseInt(process.env.KEEP_ALIVE_INTERVAL || "40000");
-  // 40 seconds - prevents Render shutdown
-  SELF_PING_INTERVAL_MS = 35e3;
-  // Self-ping every 35 seconds - more aggressive
-  BACKGROUND_TASK_INTERVAL_MS = 3e4;
-  // Background task every 30 seconds
-  EXTERNAL_PING_INTERVAL_MS = 45e3;
-  // External ping every 45 seconds
-  PING_TIMEOUT_MS = parseInt(process.env.KEEP_ALIVE_TIMEOUT || "5000");
-  // 5 seconds default (reduced timeout)
-  MAX_FAILURES = 5;
-  // Max consecutive failures before marking inactive
-  isRunning = false;
-  currentPort;
-  lastActivity = Date.now();
-  activityCounter = 0;
-  EXTERNAL_PING_URLS = [
-    "https://httpbin.org/status/200",
-    "https://jsonplaceholder.typicode.com/posts/1",
-    "https://api.github.com/zen"
-  ];
-  constructor() {
-    this.initializeServers();
-  }
-  initializeServers() {
-    console.log("\u{1F504} Self-ping enabled to prevent Render shutdown");
-    const workerServers = (process.env.WORKER_SERVERS || "").split(",").map((url) => url.trim()).filter(Boolean);
-    workerServers.forEach((url, index) => {
-      this.servers.push({
-        name: `Worker Server ${index + 1}`,
-        url,
-        type: "worker",
-        consecutiveFailures: 0,
-        isActive: true
-      });
-    });
-    const uploadWorkers = (process.env.UPLOAD_WORKERS || "").split(",").map((url) => url.trim()).filter(Boolean);
-    uploadWorkers.forEach((url, index) => {
-      this.servers.push({
-        name: `Upload Worker ${index + 1}`,
-        url,
-        type: "upload",
-        consecutiveFailures: 0,
-        isActive: true
-      });
-    });
-    const chatWorkers = (process.env.CHAT_WORKERS || "").split(",").map((url) => url.trim()).filter(Boolean);
-    chatWorkers.forEach((url, index) => {
-      this.servers.push({
-        name: `Chat Worker ${index + 1}`,
-        url,
-        type: "chat",
-        consecutiveFailures: 0,
-        isActive: true
-      });
-    });
-    console.log(`\u{1F504} Keep-alive service initialized with ${this.servers.length} servers:`);
-    this.servers.forEach((server) => {
-      console.log(`   \u{1F4E1} ${server.name} (${server.type}): ${server.url}`);
-    });
-  }
-  getCurrentServerUrl() {
-    if (process.env.MAIN_SERVER_URL) {
-      return process.env.MAIN_SERVER_URL;
-    }
-    if (process.env.RENDER_EXTERNAL_URL) {
-      return process.env.RENDER_EXTERNAL_URL;
-    }
-    if (process.env.VERCEL_URL) {
-      return `https://${process.env.VERCEL_URL}`;
-    }
-    if (process.env.RAILWAY_STATIC_URL) {
-      return process.env.RAILWAY_STATIC_URL;
-    }
-    if (process.env.NODE_ENV === "development") {
-      return null;
-    }
-    const serviceName = process.env.RENDER_SERVICE_NAME;
-    if (serviceName) {
-      return `https://${serviceName}.onrender.com`;
-    }
-    return null;
-  }
-  async pingServer(server) {
-    const startTime = Date.now();
-    const endpoints = [
-      "/api/ping",
-      // Primary API endpoint
-      "/health",
-      // Health check endpoint
-      "/api/health",
-      // Alternative health endpoint
-      "/"
-      // Root endpoint as last resort
-    ];
-    for (let i = 0; i < endpoints.length; i++) {
-      const endpoint = endpoints[i];
-      try {
-        const pingUrl = `${server.url}${endpoint}`;
-        const response = await axios.get(pingUrl, {
-          timeout: this.PING_TIMEOUT_MS,
-          headers: {
-            "User-Agent": "KeepAlive-Bot/1.0",
-            "X-Keep-Alive": "true"
-          },
-          validateStatus: (status) => {
-            return status >= 200 && status < 500;
-          }
-        });
-        const responseTime = Date.now() - startTime;
-        server.lastPing = Date.now();
-        server.consecutiveFailures = 0;
-        if (!server.isActive) {
-          console.log(`\u2705 ${server.name} is back online! (${responseTime}ms) - endpoint: ${endpoint}`);
-          server.isActive = true;
-        }
-        if (server.consecutiveFailures > 0 || i > 0) {
-          console.log(`\u{1F504} ${server.name} responded (${response.status}) via ${endpoint} (${responseTime}ms)`);
-        }
-        return true;
-      } catch (error) {
-        if (i < endpoints.length - 1) {
-          continue;
-        }
-        server.consecutiveFailures++;
-        if (server.consecutiveFailures >= this.MAX_FAILURES && server.isActive) {
-          console.error(`\u274C ${server.name} marked as inactive after ${this.MAX_FAILURES} failures`);
-          server.isActive = false;
-        }
-        if (server.consecutiveFailures <= 3) {
-          console.warn(`\u26A0\uFE0F ${server.name} ping failed (attempt ${server.consecutiveFailures}): All endpoints failed - ${error.message}`);
-        }
-        return false;
-      }
-    }
-    return false;
-  }
-  async pingAllServers() {
-    if (this.servers.length === 0) {
-      return;
-    }
-    const memoryUsage = process.memoryUsage();
-    const memoryUsageMB = memoryUsage.rss / 1024 / 1024;
-    if (memoryUsageMB > 400) {
-      console.warn(`\u26A0\uFE0F Skipping keep-alive ping due to high memory usage: ${memoryUsageMB.toFixed(1)}MB`);
-      return;
-    }
-    const startTime = Date.now();
-    let successful = 0;
-    for (const server of this.servers) {
-      try {
-        const result = await this.pingServer(server);
-        if (result) successful++;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      } catch (error) {
-      }
-    }
-    const total = this.servers.length;
-    const duration = Date.now() - startTime;
-    const pingCount = Math.floor(Date.now() / this.PING_INTERVAL_MS) % 3;
-    if (pingCount === 0 || successful !== total) {
-      const statusIcon = successful === total ? "\u2705" : successful > 0 ? "\u26A0\uFE0F" : "\u274C";
-      console.log(`${statusIcon} Keep-alive: ${successful}/${total} servers active (${duration}ms, mem: ${memoryUsageMB.toFixed(1)}MB)`);
-      const inactiveServers = this.servers.filter((s) => !s.isActive);
-      if (inactiveServers.length > 0) {
-        console.warn(`   Inactive: ${inactiveServers.map((s) => s.name).join(", ")}`);
-      }
-    }
-  }
-  start(port) {
-    if (this.isRunning) {
-      console.warn("\u26A0\uFE0F Keep-alive service is already running");
-      return;
-    }
-    if (port) {
-      this.currentPort = port;
-    }
-    console.log(`\u{1F680} Starting enhanced keep-alive service (multiple strategies to prevent Render shutdown)`);
-    console.log(`   \u{1F504} Self-ping: every ${this.SELF_PING_INTERVAL_MS / 1e3}s`);
-    console.log(`   \u{1F4CA} Background tasks: every ${this.BACKGROUND_TASK_INTERVAL_MS / 1e3}s`);
-    console.log(`   \u{1F310} External pings: every ${this.EXTERNAL_PING_INTERVAL_MS / 1e3}s`);
-    if (this.servers.length > 0) {
-      console.log(`   \u{1F4E1} Worker pings: every ${this.PING_INTERVAL_MS / 1e3}s (${this.servers.length} workers)`);
-    }
-    console.log(`   \u{1F3AF} Target: prevent 50s Render auto-shutdown with 35s max intervals`);
-    if (this.servers.length > 0) {
-      setTimeout(() => {
-        this.pingAllServers();
-      }, 5e3);
-      this.pingInterval = setInterval(() => {
-        this.pingAllServers();
-      }, this.PING_INTERVAL_MS);
-    }
-    this.startSelfPing();
-    this.startBackgroundTasks();
-    this.startExternalPings();
-    this.isRunning = true;
-    this.lastActivity = Date.now();
-    this.activityCounter = 0;
-  }
-  startSelfPing() {
-    if (!this.currentPort) {
-      console.warn("\u26A0\uFE0F No port specified, self-ping disabled");
-      return;
-    }
-    const productionUrl = process.env.PRODUCTION_SERVER_URL || process.env.RENDER_EXTERNAL_URL;
-    const targetUrl = productionUrl ? `${productionUrl}/api/ping` : `http://127.0.0.1:${this.currentPort}/api/ping`;
-    const urlType = productionUrl ? "production" : "local";
-    console.log(`\u{1F504} Starting self-ping to ${urlType} server (${this.SELF_PING_INTERVAL_MS / 1e3}s intervals)`);
-    console.log(`   \u{1F4E1} Target URL: ${targetUrl}`);
-    setTimeout(() => {
-      this.performSelfPing();
-    }, 2e3);
-    this.selfPingInterval = setInterval(() => {
-      this.performSelfPing();
-    }, this.SELF_PING_INTERVAL_MS);
-  }
-  startBackgroundTasks() {
-    console.log(`\u{1F4CA} Starting background tasks (${this.BACKGROUND_TASK_INTERVAL_MS / 1e3}s intervals)`);
-    setTimeout(() => {
-      this.performBackgroundTask();
-    }, 1e4);
-    this.backgroundTaskInterval = setInterval(() => {
-      this.performBackgroundTask();
-    }, this.BACKGROUND_TASK_INTERVAL_MS);
-  }
-  startExternalPings() {
-    if (process.env.NODE_ENV === "development") {
-      console.log("\u{1F310} External pings disabled in development mode");
-      return;
-    }
-    console.log(`\u{1F310} Starting external pings (${this.EXTERNAL_PING_INTERVAL_MS / 1e3}s intervals)`);
-    setTimeout(() => {
-      this.performExternalPing();
-    }, 15e3);
-    this.externalPingInterval = setInterval(() => {
-      this.performExternalPing();
-    }, this.EXTERNAL_PING_INTERVAL_MS);
-  }
-  async performSelfPing() {
-    if (!this.currentPort) return;
-    const productionUrl = process.env.PRODUCTION_SERVER_URL || process.env.RENDER_EXTERNAL_URL;
-    const selfUrl = productionUrl ? `${productionUrl}/api/ping` : `http://127.0.0.1:${this.currentPort}/api/ping`;
-    this.activityCounter++;
-    this.lastActivity = Date.now();
-    try {
-      const response = await axios.get(selfUrl, {
-        timeout: this.PING_TIMEOUT_MS,
-        headers: {
-          "User-Agent": "KeepAlive-SelfPing/1.0",
-          "X-Keep-Alive": "true",
-          "X-Activity-Counter": this.activityCounter.toString()
-        }
-      });
-      if (response.status === 200) {
-        const urlType = productionUrl ? "production" : "local";
-        console.log(`\u{1F504} Self-ping #${this.activityCounter} successful (${response.status}) - ${urlType} server staying alive`);
-      }
-    } catch (error) {
-      console.warn(`\u26A0\uFE0F Self-ping #${this.activityCounter} failed:`, error.message);
-      await this.performAlternativeSelfPing();
-    }
-  }
-  async performAlternativeSelfPing() {
-    if (!this.currentPort) return;
-    const alternativeEndpoints = ["/health", "/api/health", "/"];
-    const productionUrl = process.env.PRODUCTION_SERVER_URL || process.env.RENDER_EXTERNAL_URL;
-    const baseUrl = productionUrl || `http://127.0.0.1:${this.currentPort}`;
-    for (const endpoint of alternativeEndpoints) {
-      try {
-        const selfUrl = `${baseUrl}${endpoint}`;
-        const response = await axios.get(selfUrl, {
-          timeout: this.PING_TIMEOUT_MS,
-          headers: {
-            "User-Agent": "KeepAlive-Alternative/1.0",
-            "X-Keep-Alive": "true"
-          }
-        });
-        const urlType = productionUrl ? "production" : "local";
-        console.log(`\u{1F504} Alternative ${urlType} self-ping via ${endpoint} successful (${response.status})`);
-        return;
-      } catch (error) {
-        continue;
-      }
-    }
-    console.warn("\u26A0\uFE0F All alternative self-ping endpoints failed");
-  }
-  async performBackgroundTask() {
-    this.activityCounter++;
-    this.lastActivity = Date.now();
-    try {
-      const start = Date.now();
-      let sum = 0;
-      for (let i = 0; i < 1e4; i++) {
-        sum += Math.random();
-      }
-      const duration = Date.now() - start;
-      const memoryUsage = process.memoryUsage();
-      const memoryUsageMB = memoryUsage.rss / 1024 / 1024;
-      console.log(`\u{1F504} Background task #${this.activityCounter} completed (${duration}ms, mem: ${memoryUsageMB.toFixed(1)}MB)`);
-      if (memoryUsageMB > 400) {
-        if (global.gc) {
-          global.gc();
-          console.log("\u{1F5D1}\uFE0F Garbage collection triggered due to high memory usage");
-        }
-      }
-      try {
-        const neonManager = await Promise.resolve().then(() => (init_neon_manager(), neon_manager_exports));
-        const urls = await neonManager.default.getNeonDbUrls();
-        const thresholdBytes = parseInt(process.env.NEON_DB_MAX_BYTES || String(0), 10) || 0;
-        if (thresholdBytes > 0 && urls && urls.length > 0) {
-          const primary = urls[0];
-          const size = await neonManager.getDbSizeBytes(primary);
-          if (size !== null) {
-            console.log(`[KeepAlive] Primary Neon DB size: ${size} bytes`);
-            if (size >= thresholdBytes) {
-              console.log(`[KeepAlive] Primary Neon DB reached threshold ${thresholdBytes}, triggering replication`);
-              (async () => {
-                try {
-                  await neonManager.default.tryReplicateToAnotherNeon(thresholdBytes);
-                } catch (err) {
-                  console.warn("[KeepAlive] Neon replication attempt failed", err);
-                }
-              })();
-            }
-          }
-        }
-      } catch (err) {
-        console.warn("[KeepAlive] Neon manager check failed", err?.message || err);
-      }
-    } catch (error) {
-      console.warn("\u26A0\uFE0F Background task failed:", error.message);
-    }
-  }
-  async performExternalPing() {
-    this.activityCounter++;
-    const randomUrl = this.EXTERNAL_PING_URLS[Math.floor(Math.random() * this.EXTERNAL_PING_URLS.length)];
-    try {
-      const response = await axios.get(randomUrl, {
-        timeout: this.PING_TIMEOUT_MS,
-        headers: {
-          "User-Agent": "KeepAlive-External/1.0",
-          "X-Activity-Counter": this.activityCounter.toString()
-        }
-      });
-      console.log(`\u{1F310} External ping #${this.activityCounter} to ${new URL(randomUrl).hostname} successful (${response.status})`);
-    } catch (error) {
-      console.warn(`\u26A0\uFE0F External ping #${this.activityCounter} failed:`, error.message);
-    }
-  }
-  getStatus() {
-    const now = Date.now();
-    const uptime = this.isRunning ? now - (this.lastActivity - this.activityCounter * 35e3) : 0;
-    const timeSinceLastActivity = now - this.lastActivity;
-    return {
-      isRunning: this.isRunning,
-      serverCount: this.servers.length,
-      activeServers: this.servers.filter((s) => s.isActive).length,
-      activityCounter: this.activityCounter,
-      lastActivity: new Date(this.lastActivity).toISOString(),
-      timeSinceLastActivity: Math.floor(timeSinceLastActivity / 1e3),
-      uptime: Math.floor(uptime / 1e3),
-      strategies: {
-        selfPing: {
-          enabled: !!this.selfPingInterval,
-          interval: this.SELF_PING_INTERVAL_MS / 1e3,
-          port: this.currentPort
-        },
-        backgroundTasks: {
-          enabled: !!this.backgroundTaskInterval,
-          interval: this.BACKGROUND_TASK_INTERVAL_MS / 1e3
-        },
-        externalPings: {
-          enabled: !!this.externalPingInterval,
-          interval: this.EXTERNAL_PING_INTERVAL_MS / 1e3
-        },
-        workerPings: {
-          enabled: !!this.pingInterval,
-          interval: this.PING_INTERVAL_MS / 1e3
-        }
-      },
-      servers: this.servers.map((s) => ({
-        name: s.name,
-        url: s.url,
-        type: s.type,
-        isActive: s.isActive,
-        consecutiveFailures: s.consecutiveFailures,
-        lastPing: s.lastPing ? new Date(s.lastPing).toISOString() : null
-      }))
-    };
-  }
-  // Method to add additional servers dynamically
-  addServer(name, url, type) {
-    const existingServer = this.servers.find((s) => s.url === url);
-    if (existingServer) {
-      console.warn(`\u26A0\uFE0F Server ${url} already exists in keep-alive list`);
-      return;
-    }
-    this.servers.push({
-      name,
-      url,
-      type,
-      consecutiveFailures: 0,
-      isActive: true
-    });
-    console.log(`\u2795 Added ${name} to keep-alive list: ${url}`);
-  }
-  // Method to remove servers dynamically
-  removeServer(url) {
-    const index = this.servers.findIndex((s) => s.url === url);
-    if (index === -1) {
-      console.warn(`\u26A0\uFE0F Server ${url} not found in keep-alive list`);
-      return;
-    }
-    const server = this.servers[index];
-    this.servers.splice(index, 1);
-    console.log(`\u2796 Removed ${server.name} from keep-alive list`);
-  }
-  // Emergency pause method for memory pressure
-  emergencyPause(durationMs) {
-    console.log(`\u{1F6A8} Emergency pause: Keep-alive service paused for ${durationMs / 1e3}s due to memory pressure`);
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = null;
-    }
-    if (this.selfPingInterval) {
-      clearInterval(this.selfPingInterval);
-      this.selfPingInterval = null;
-      console.log("\u{1F6A8} Critical memory - pausing self-ping too");
-    }
-    if (this.backgroundTaskInterval) {
-      clearInterval(this.backgroundTaskInterval);
-      this.backgroundTaskInterval = null;
-    }
-    if (this.externalPingInterval) {
-      clearInterval(this.externalPingInterval);
-      this.externalPingInterval = null;
-    }
-    setTimeout(() => {
-      if (this.isRunning) {
-        console.log("\u{1F504} Restarting keep-alive service after emergency pause");
-        this.start(this.currentPort);
-      }
-    }, durationMs);
-  }
-  // Stop method for graceful shutdown
-  stop() {
-    console.log("\u{1F6D1} Stopping keep-alive service");
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = null;
-    }
-    if (this.selfPingInterval) {
-      clearInterval(this.selfPingInterval);
-      this.selfPingInterval = null;
-    }
-    if (this.backgroundTaskInterval) {
-      clearInterval(this.backgroundTaskInterval);
-      this.backgroundTaskInterval = null;
-    }
-    if (this.externalPingInterval) {
-      clearInterval(this.externalPingInterval);
-      this.externalPingInterval = null;
-    }
-    this.isRunning = false;
-  }
-};
-var keepAliveService = new KeepAliveService();
-process.on("SIGINT", () => {
-  console.log("\n\u{1F50C} Received SIGINT, stopping keep-alive service...");
-  keepAliveService.stop();
-});
-process.on("SIGTERM", () => {
-  console.log("\n\u{1F50C} Received SIGTERM, stopping keep-alive service...");
-  keepAliveService.stop();
-});
-function pingAllDatabases() {
-  const instances = dbManager.getAllInstances();
-  instances.forEach(async (instance) => {
-    try {
-      await instance.db.executeRaw?.("SELECT 1");
-      console.log(`[KeepAlive] Pinged DB shard ${instance.id}`);
-    } catch (err) {
-      console.warn(`[KeepAlive] Failed to ping DB shard ${instance.id}:`, err?.message || err);
-    }
-  });
-}
-setInterval(pingAllDatabases, 3e4);
-
-// server/routes.ts
 import { eq as eq3, and as and2, or as or2, ilike as ilike2, exists as exists2, isNotNull as isNotNull2, sql as sql3 } from "drizzle-orm";
 
 // server/distributed-chunk-manager.ts
-import axios2 from "axios";
+import axios from "axios";
 import crypto2 from "crypto";
 var DistributedChunkManager = class {
   uploadServers = /* @__PURE__ */ new Map();
@@ -6651,7 +5652,7 @@ var DistributedChunkManager = class {
       const externalListUrl = process.env.EXTERNAL_SERVER_LIST_URL;
       if (externalListUrl) {
         console.log("\u{1F310} Loading servers from external list...");
-        const response = await axios2.get(externalListUrl, { timeout: 1e4 });
+        const response = await axios.get(externalListUrl, { timeout: 1e4 });
         if (Array.isArray(response.data)) {
           response.data.forEach((serverConfig) => {
             if (typeof serverConfig === "string") {
@@ -6839,7 +5840,7 @@ var DistributedChunkManager = class {
         if (!effectiveChunk) {
           return { success: false, message: "Chunk data not found" };
         }
-        const response = await axios2.post(`${server.url}/api/upload/chunk`, {
+        const response = await axios.post(`${server.url}/api/upload/chunk`, {
           jobId: job.id,
           fileId: job.fileId,
           chunkIndex: job.chunkIndex,
@@ -7001,7 +6002,7 @@ var DistributedChunkManager = class {
   async performHealthChecks() {
     const healthPromises = Array.from(this.uploadServers.values()).map(async (server) => {
       try {
-        const response = await axios2.get(`${server.url}/health`, {
+        const response = await axios.get(`${server.url}/health`, {
           timeout: 15e3,
           // Increased timeout for health checks, but not unlimited
           headers: {
@@ -7277,7 +6278,7 @@ import { Transform as Transform2 } from "stream";
 import { createHash } from "crypto";
 import { createReadStream, unlink } from "fs";
 import { pipeline } from "stream/promises";
-import path3 from "path";
+import path2 from "path";
 import os from "os";
 import sharp from "sharp";
 import ffmpeg from "fluent-ffmpeg";
@@ -7419,7 +6420,7 @@ async function processStreamingUpload(filePath, originalName, forumId, userId, d
     const fileRecord = await storage2.createFile(
       forumId,
       userId,
-      path3.basename(originalName),
+      path2.basename(originalName),
       stats.size,
       mimeType,
       thumbnail,
@@ -7430,7 +6431,7 @@ async function processStreamingUpload(filePath, originalName, forumId, userId, d
         // Identifier for user uploads
         metaTitle: originalName,
         metaDescription: `File uploaded to forum`,
-        keywords: path3.extname(originalName).slice(1)
+        keywords: path2.extname(originalName).slice(1)
       }
     );
     console.log(`\u2705 Created file record in database: ${fileRecord.id}`);
@@ -7470,7 +6471,7 @@ async function processStreamingUpload(filePath, originalName, forumId, userId, d
   }
 }
 function getMimeType(filename) {
-  const ext = path3.extname(filename).toLowerCase();
+  const ext = path2.extname(filename).toLowerCase();
   const mimeTypes = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -7523,8 +6524,8 @@ async function generateVideoThumbnail(videoPath) {
     const tempThumbnailPath = `${videoPath}.thumb.jpg`;
     ffmpeg(videoPath).screenshots({
       count: 1,
-      folder: path3.dirname(videoPath),
-      filename: path3.basename(tempThumbnailPath),
+      folder: path2.dirname(videoPath),
+      filename: path2.basename(tempThumbnailPath),
       timemarks: ["10%"],
       // Take thumbnail at 10% of video duration
       size: "300x300"
@@ -7801,32 +6802,6 @@ function parseCookies(cookieHeader) {
 }
 var clients = /* @__PURE__ */ new Map();
 async function registerRoutes(app2) {
-  app2.get("/api/ping", (req, res) => {
-    const isKeepAlive = req.get("X-Keep-Alive") === "true";
-    const activityCounter = req.get("X-Activity-Counter");
-    const memoryUsage = process.memoryUsage();
-    const response = {
-      status: "alive",
-      timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-      uptime: Math.floor(process.uptime()),
-      memory: {
-        rss: Math.round(memoryUsage.rss / 1024 / 1024),
-        // MB
-        heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024),
-        // MB
-        external: Math.round(memoryUsage.external / 1024 / 1024)
-        // MB
-      },
-      keepAlive: {
-        isKeepAliveRequest: isKeepAlive,
-        activityCounter: activityCounter ? parseInt(activityCounter) : void 0
-      }
-    };
-    if (isKeepAlive && activityCounter) {
-      console.log(`\u{1F504} Keep-alive ping #${activityCounter} received - server staying active`);
-    }
-    res.json(response);
-  });
   app2.get("/health", (req, res) => {
     const memoryUsage = process.memoryUsage();
     res.json({
@@ -7838,12 +6813,6 @@ async function registerRoutes(app2) {
         heap: Math.round(memoryUsage.heapUsed / 1024 / 1024),
         percentage: Math.round(memoryUsage.rss / (512 * 1024 * 1024) * 100)
         // Assuming 512MB limit
-      },
-      renderPrevention: {
-        enabled: true,
-        maxInactivitySeconds: 50,
-        keepAliveIntervalSeconds: 35,
-        status: "protected"
       }
     });
   });
@@ -7878,6 +6847,29 @@ async function registerRoutes(app2) {
   };
   const optionalAuth = (req, res, next) => {
     next();
+  };
+  const isAdminUser = async (user) => {
+    if (!user?.username && !user?.email) {
+      return false;
+    }
+    const instances = dbManager.getAllInstances();
+    for (const instance of instances) {
+      try {
+        const admin = await instance.db.select({ id: adminUsers.id }).from(adminUsers).where(and2(
+          eq3(adminUsers.isActive, true),
+          or2(
+            user.username ? eq3(adminUsers.username, user.username) : sql3`false`,
+            user.email ? eq3(adminUsers.email, user.email) : sql3`false`
+          )
+        )).limit(1).then((rows) => rows[0]);
+        if (admin) {
+          return true;
+        }
+      } catch (error) {
+        console.error(`Error checking admin user in shard ${instance.id}:`, error);
+      }
+    }
+    return false;
   };
   app2.get("/api/debug/auth", async (req, res) => {
     try {
@@ -7914,20 +6906,6 @@ async function registerRoutes(app2) {
       res.json({ message: "Test user created successfully", user: { id: user.id, username: user.username } });
     } catch (error) {
       res.status(500).json({ error: error.message });
-    }
-  });
-  app2.get("/api/keep-alive/status", async (req, res) => {
-    try {
-      const status = keepAliveService.getStatus();
-      res.json({
-        ...status,
-        timestamp: (/* @__PURE__ */ new Date()).toISOString()
-      });
-    } catch (error) {
-      res.status(500).json({
-        error: "Failed to get keep-alive status",
-        message: error.message
-      });
     }
   });
   const { clusterManager: clusterManager2 } = await Promise.resolve().then(() => (init_cluster_manager(), cluster_manager_exports));
@@ -10601,8 +9579,8 @@ Referer: ${defaultHeaders["Referer"]}\r
   });
   app2.get("/api/tags", optionalAuth, async (req, res, next) => {
     try {
-      const includeExtracted = String(req.query.includeExtracted || "false") === "true";
-      const tags2 = await storage.getTags(includeExtracted);
+      const forumId = typeof req.query.forumId === "string" && req.query.forumId.trim().length > 0 ? req.query.forumId.trim() : void 0;
+      const tags2 = await storage.getTags(false, forumId);
       res.json(tags2);
     } catch (error) {
       next(error);
@@ -10610,14 +9588,26 @@ Referer: ${defaultHeaders["Referer"]}\r
   });
   app2.post("/api/tags", requireAuth, async (req, res, next) => {
     try {
-      const { name, description, color } = req.body;
+      const { name, description, color, forumId } = req.body;
       if (!name || typeof name !== "string" || name.trim().length === 0) {
         return res.status(400).send("Tag name is required");
+      }
+      if (!forumId || typeof forumId !== "string" || forumId.trim().length === 0) {
+        return res.status(400).send("forumId is required");
+      }
+      const forum = await storage.getForumById(forumId.trim());
+      if (!forum) {
+        return res.status(404).send("Forum not found");
+      }
+      if (forum.creatorId !== req.user.id) {
+        return res.status(403).send("Only forum creator can create tags");
       }
       const tag = await storage.createTag({
         name: name.trim(),
         description: description?.trim(),
-        color: color || "#6b7280"
+        color: color || "#6b7280",
+        forumId: forum.id,
+        createdBy: req.user.id
       });
       clients.forEach((c) => {
         if (c.ws.readyState === WebSocket2.OPEN) {
@@ -10649,6 +9639,23 @@ Referer: ${defaultHeaders["Referer"]}\r
       if (!name || typeof name !== "string" || name.trim().length === 0) {
         return res.status(400).send("Tag name is required");
       }
+      const existingTag = await storage.getTagById(req.params.id);
+      if (!existingTag) {
+        return res.status(404).send("Tag not found");
+      }
+      const admin = await isAdminUser(req.user);
+      if (!admin) {
+        if (!existingTag.forumId) {
+          return res.status(403).send("Only admin can update legacy tags without forum ownership");
+        }
+        const forum = await storage.getForumById(existingTag.forumId);
+        if (!forum) {
+          return res.status(404).send("Forum not found");
+        }
+        if (forum.creatorId !== req.user.id) {
+          return res.status(403).send("Only forum creator can update tags");
+        }
+      }
       const tag = await storage.updateTag(req.params.id, {
         name: name.trim(),
         description: description?.trim(),
@@ -10675,6 +9682,19 @@ Referer: ${defaultHeaders["Referer"]}\r
       const tag = await storage.getTagById(req.params.id);
       if (!tag) {
         return res.status(404).send("Tag not found");
+      }
+      const admin = await isAdminUser(req.user);
+      if (!admin) {
+        if (!tag.forumId) {
+          return res.status(403).send("Only admin can delete legacy tags without forum ownership");
+        }
+        const forum = await storage.getForumById(tag.forumId);
+        if (!forum) {
+          return res.status(404).send("Forum not found");
+        }
+        if (forum.creatorId !== req.user.id) {
+          return res.status(403).send("Only forum creator can delete tags");
+        }
       }
       await storage.deleteTag(req.params.id);
       clients.forEach((c) => {
@@ -10762,22 +9782,20 @@ Referer: ${defaultHeaders["Referer"]}\r
       if (!forumId) {
         return res.status(400).send("Could not determine forum ID");
       }
-      if (entityType === "forum") {
-        const forum = await storage.getForumById(forumId);
-        if (forum?.creatorId !== req.user.id) {
-          return res.status(403).send("Only forum creator can manage forum tags");
-        }
+      const forum = await storage.getForumById(forumId);
+      if (!forum) {
+        return res.status(404).send("Forum not found");
       }
-      if (entityType !== "forum") {
-        const forum = await storage.getForumById(forumId);
-        if (!forum) {
-          return res.status(404).send("Forum not found");
+      if (forum.creatorId !== req.user.id) {
+        return res.status(403).send("Only forum creator can assign tags");
+      }
+      for (const tagId of tagIds) {
+        const tag = await storage.getTagById(tagId);
+        if (!tag) {
+          return res.status(404).send(`Tag not found: ${tagId}`);
         }
-        if (!forum.isPublic) {
-          const isMember = await storage.isForumMember(forum.id, req.user.id);
-          if (!isMember) {
-            return res.status(403).send("Access denied");
-          }
+        if (tag.forumId && tag.forumId !== forumId) {
+          return res.status(403).send("Cannot assign tags created for another forum");
         }
       }
       const assignments = await storage.assignTagsToEntity(entityType, entityId, tagIds);
@@ -10827,23 +9845,19 @@ Referer: ${defaultHeaders["Referer"]}\r
       if (!forumId) {
         return res.status(400).send("Could not determine forum ID");
       }
-      if (entityType === "forum") {
-        const forum = await storage.getForumById(forumId);
-        if (forum?.creatorId !== req.user.id) {
-          return res.status(403).send("Only forum creator can manage forum tags");
-        }
+      const forum = await storage.getForumById(forumId);
+      if (!forum) {
+        return res.status(404).send("Forum not found");
       }
-      if (entityType !== "forum") {
-        const forum = await storage.getForumById(forumId);
-        if (!forum) {
-          return res.status(404).send("Forum not found");
-        }
-        if (!forum.isPublic) {
-          const isMember = await storage.isForumMember(forum.id, req.user.id);
-          if (!isMember) {
-            return res.status(403).send("Access denied");
-          }
-        }
+      if (forum.creatorId !== req.user.id) {
+        return res.status(403).send("Only forum creator can unassign tags");
+      }
+      const tag = await storage.getTagById(tagId);
+      if (!tag) {
+        return res.status(404).send("Tag not found");
+      }
+      if (tag.forumId && tag.forumId !== forumId) {
+        return res.status(403).send("Cannot unassign tags created for another forum");
       }
       await storage.removeTagFromEntity(entityType, entityId, tagId);
       if (entityType === "forum") {
@@ -10874,38 +9888,18 @@ Referer: ${defaultHeaders["Referer"]}\r
         return res.status(400).send("Query is required");
       }
       console.log(`[API] Search request: query="${query}", user=${req.user?.username || "anonymous"}`);
-      console.log(`[API] Starting comprehensive search across extracted databases and local databases...`);
+      console.log(`[API] Starting search across local databases...`);
       const startTime = Date.now();
       const forumId = req.query.forumId;
       const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit || "20"), 10)));
       const offset = Math.max(0, parseInt(String(req.query.offset || "0"), 10));
       const localResults = await storage.searchEntities(query, req.user?.id, forumId);
-      const extractedFiles2 = await storage.searchExtractedFiles(query, forumId);
-      const allFilesMap = {};
-      for (const f of [...localResults.files, ...extractedFiles2]) {
-        allFilesMap[f.id] = f;
-      }
-      const mergedFiles = Object.values(allFilesMap).sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
-      const totalFiles = mergedFiles.length;
-      const paginatedFiles = mergedFiles.slice(offset, offset + limit);
+      const sortedFiles = localResults.files.sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+      const totalFiles = sortedFiles.length;
+      const paginatedFiles = sortedFiles.slice(offset, offset + limit);
       const duration = Date.now() - startTime;
       console.log(`[API] Search completed: query="${query}", totalFiles:${totalFiles}, returned:${paginatedFiles.length}, duration=${duration}ms`);
       res.json({ forums: localResults.forums, messages: localResults.messages, files: paginatedFiles, totalFiles });
-    } catch (error) {
-      next(error);
-    }
-  });
-  app2.get("/api/search/extracted", optionalAuth, async (req, res, next) => {
-    try {
-      const query = req.query.q;
-      if (!query) return res.status(400).send("Query is required");
-      const forumId = req.query.forumId;
-      const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit || "20"), 10)));
-      const offset = Math.max(0, parseInt(String(req.query.offset || "0"), 10));
-      const results = await storage.searchExtractedFiles(query, forumId);
-      const totalFiles = results.length;
-      const files2 = results.sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()).slice(offset, offset + limit);
-      res.json({ files: files2, totalFiles });
     } catch (error) {
       next(error);
     }
@@ -11149,124 +10143,6 @@ data: {}
       next(error);
     }
   });
-  app2.get("/api/search/extracted/stream", optionalAuth, async (req, res, next) => {
-    try {
-      const query = String(req.query.q || "");
-      if (!query) return res.status(400).send("Query required");
-      const forumId = req.query.forumId;
-      const userId = req.user?.id;
-      if (forumId) {
-        const forum = await storage.getForumById(forumId);
-        if (!forum) return res.status(404).send("Forum not found");
-        if (!forum.isPublic) {
-          if (!req.isAuthenticated?.() || !req.user) return res.sendStatus(401);
-          const isMember = await storage.isForumMember(forumId, req.user.id);
-          if (!isMember) return res.status(403).send("Access denied");
-        }
-      }
-      res.setHeader("Content-Type", "text/event-stream");
-      res.setHeader("Cache-Control", "no-cache");
-      res.setHeader("Connection", "keep-alive");
-      res.flushHeaders?.();
-      const dbUrls = await (await Promise.resolve().then(() => (init_neon_manager(), neon_manager_exports))).default.getNeonDbUrls();
-      const searchTerms = query.toLowerCase().split(/\s+/).filter((t) => t.length > 0);
-      const batchSize = 5;
-      let extractedStreamedCount = 0;
-      for (let i = 0; i < dbUrls.length; i++) {
-        const dbU = dbUrls[i];
-        const dbIdentifier = dbU.split("@")[1]?.split(".")[0] || `db${i + 1}`;
-        try {
-          const { Client: Client2 } = await import("pg");
-          const client = new Client2({ connectionString: dbU });
-          await client.connect();
-          const tableCheck = await client.query(`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'video_mappings');`);
-          if (!tableCheck.rows[0].exists) {
-            await client.end();
-            continue;
-          }
-          let offset = 0;
-          let done = false;
-          while (!done) {
-            const { rows } = await client.query(`SELECT id, name, video, image, url, uploaddate, tags, uploadedby, size, type, last_updated FROM video_mappings ORDER BY last_updated DESC LIMIT ${batchSize} OFFSET ${offset}`);
-            if (!rows || rows.length === 0) {
-              done = true;
-              break;
-            }
-            const adminUser = await storage.getUserByUsername("admin");
-            const forums2 = await storage.getForums();
-            let xmasterForum = forums2.find((f) => f.name === "Xmaster");
-            if (!xmasterForum && adminUser) {
-              try {
-                xmasterForum = await storage.createForum({ name: "Xmaster", description: "Extracted videos from external sources", isPublic: true, metaTitle: "Xmaster" }, adminUser.id);
-              } catch (e) {
-                console.warn("Failed to create Xmaster forum", e);
-              }
-            }
-            for (const row of rows) {
-              const searchableText = [row.name || "", row.tags || "", row.uploadedby || "", row.video || "", row.url || ""].join(" ").toLowerCase();
-              if (searchTerms.every((term) => searchableText.includes(term))) {
-                const file = {
-                  id: `extracted_${i}_${row.id}`,
-                  forumId: xmasterForum?.id || "xmaster-forum-id",
-                  userId: adminUser?.id || "xmaster-user-id",
-                  fileName: row.name || "Unknown Video",
-                  fileSize: parseInt(row.size) || 0,
-                  mimeType: row.type || "video/mp4",
-                  thumbnail: row.image || null,
-                  adminThumbnailUrl: row.image || null,
-                  metaTitle: row.name || null,
-                  uploadedAt: new Date(row.uploaddate || row.last_updated || Date.now()),
-                  isAdminCreated: true,
-                  adminCreatedBy: "XMaster",
-                  user: {
-                    id: adminUser?.id || "xmaster-user-id",
-                    username: "XMaster",
-                    email: adminUser?.email || "xmaster@example.com",
-                    displayName: "XMaster",
-                    avatar: adminUser?.avatar || null,
-                    createdAt: adminUser?.createdAt || /* @__PURE__ */ new Date(),
-                    isAdmin: true,
-                    isActive: true
-                  },
-                  forum: xmasterForum
-                };
-                res.write(`data: ${JSON.stringify({ type: "file", data: file })}
-
-`);
-                extractedStreamedCount++;
-                await new Promise((r) => setTimeout(r, 5));
-              }
-            }
-            if (rows.length > 0) {
-              res.write(`event: count
-data: ${JSON.stringify({ source: "extracted", count: extractedStreamedCount })}
-
-`);
-            }
-            offset += batchSize;
-            if (rows.length < batchSize) done = true;
-          }
-          await client.end();
-        } catch (err) {
-          console.warn("Search extracted stream db error", dbIdentifier, err.message || err);
-        }
-      }
-      res.write(`event: count
-data: ${JSON.stringify({ source: "extracted", count: extractedStreamedCount })}
-
-`);
-      res.write(`event: done
-data: {}
-
-`);
-      res.end();
-    } catch (error) {
-      next(error);
-    }
-  });
-  const resolvedExtractedCache = /* @__PURE__ */ new Map();
-  const RESOLVE_TTL_MS = 60 * 1e3;
-  const VERCEL_PROXY_BASE = process.env.VERCEL_PROXY_BASE || "https://webproxier-ov6et6gpw-ogeshs-projects.vercel.app/api/proxy?url=";
   app2.get("/api/extracted/:id/resolve", optionalAuth, async (req, res, next) => {
     try {
       const idParam = req.params.id;
@@ -12211,11 +11087,9 @@ var isVercelRuntime = process.env.VERCEL === "1" || process.env.VERCEL === "true
 if (!isVercelRuntime) {
   memoryOptimizer.on("memoryExhaustion", (data) => {
     console.error("\u{1F6A8} Memory exhaustion detected:", data);
-    keepAliveService.emergencyPause(12e4);
   });
   memoryOptimizer.on("memoryWarning", (data) => {
     console.warn("\u26A0\uFE0F Memory warning:", data);
-    keepAliveService.emergencyPause(6e4);
   });
 }
 app.use(express3.json({
@@ -12329,17 +11203,7 @@ var initApp = async () => {
         // Changed from "localhost" to "0.0.0.0" for Render
       }, () => {
         log(`\u{1F680} Server running on port ${port}`);
-        const keepAliveEnabled = process.env.KEEP_ALIVE_ENABLED === "true" || process.env.KEEP_ALIVE_ENABLED !== "false" && (process.env.NODE_ENV === "production" || process.env.RENDER_EXTERNAL_URL);
-        if (keepAliveEnabled && !isVercelRuntime) {
-          setTimeout(() => {
-            keepAliveService.start(port);
-          }, 15e3);
-          log(`\u{1F504} Keep-alive service will start with self-ping on port ${port}`);
-        } else if (isVercelRuntime) {
-          log("\u{1F504} Keep-alive service disabled for Vercel runtime");
-        } else {
-          log("\u{1F504} Keep-alive service disabled");
-        }
+        log("\u2139\uFE0F Keep-alive ping system disabled; service wakes on demand");
         if (process.env.NODE_ENV === "development") {
           log(`\u{1F4CA} Memory monitoring active (limit: ${memoryOptimizer.getMemoryStats().limit}MB)`);
           const clusterMetrics = clusterManager.getClusterMetrics();
@@ -12363,7 +11227,6 @@ var initApp = async () => {
           console.log("\u2705 HTTP server closed");
         });
         if (!isVercelRuntime) {
-          keepAliveService.stop();
           loadBalancer.shutdown();
           clusterManager.shutdown();
           memoryOptimizer.shutdown();

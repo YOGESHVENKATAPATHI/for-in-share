@@ -565,7 +565,7 @@ export default function HomePage() {
                       <div className="flex flex-wrap gap-1.5 sm:gap-2 mb-4 sm:mb-6 lg:mb-8">
                         {forumTags.slice(0, maxTagsToShow).map(tag => {
                           return (
-                            <span key={tag.id} className="text-xs font-medium text-zinc-400 bg-zinc-800 px-2 py-1 rounded-none break-words" title={tag.name}>
+                            <span key={tag.id} className="text-xs font-medium text-zinc-400 bg-zinc-800 px-2 py-1 rounded-none truncate max-w-[120px] inline-block shrink-0" title={tag.name}>
                               #{tag.name}
                             </span>
                           );
